@@ -117,6 +117,7 @@ MAX_RECENT_MESSAGES = 20
 IGNORE_PREFIX = "#"     # 前缀特殊字符
 
 _final_save_done = False            # 全局保存标识
+_sleep_maintenance_done = False     # 本次睡眠是否已做过维护（避免重复全量落盘）
 _napcat_websocket = None             # 当前连接的 NapCat 反向 WebSocket
 _cognitive_task = None               # 永续认知循环 task
 _shutdown_event = None               # 服务停止信号（在事件循环线程内 set）
@@ -258,29 +259,76 @@ def is_sleeping() -> bool:
     return BIORHYTHM.is_asleep()
 
 def enter_sleep():
-    """进入睡眠状态，并执行睡眠维护"""
+    """进入睡眠状态。
+
+    睡眠维护（全量落盘 + faiss 重建，实测十几秒）放到线程池执行：
+    它由 drift_loop 在事件循环里调用，同步跑会卡住收消息与生物钟 tick。
+    睡眠期间 NapCat 必须保持连接——被 @ 唤醒全靠这条通道。
+    """
     global _sleeping
     _sleeping = True
-    logger.info(f"{BOT_NAME}进入了睡眠状态")
+    logger.info(f"{BOT_NAME}进入了睡眠状态（NapCat 保持连接以便唤醒）")
+    try:
+        loop = asyncio.get_running_loop()
+        loop.run_in_executor(None, _sleep_maintenance_bg)
+    except RuntimeError:
+        # 无事件循环时（启动早期/CLI）同步执行
+        _sleep_maintenance_bg()
+
+def wake_up():
+    """从睡眠中唤醒"""
+    global _sleeping, _sleep_maintenance_done
+    _sleeping = False
+    _sleep_maintenance_done = False   # 下一觉需要重新做维护
+    logger.info(f"{BOT_NAME}醒来了！")
+
+def init_sleep_state():
+    """启动时调用：只标记睡眠状态，不执行重量级维护。
+
+    必须轻量：它跑在 WS 服务器启动之前，而睡眠维护（全量落盘 + faiss 重建）
+    要十几秒。若在这里同步执行，NapCat 连不上来，被 @ 唤醒的通道就不存在了。
+    真正的维护由 start_server 起来后异步补做（见 schedule_sleep_maintenance）。
+    """
+    global _sleeping
+    if is_sleeping():
+        _sleeping = True
+        logger.info(f"{BOT_NAME}处于睡眠时段，等待 NapCat 连接以便被唤醒")
+    else:
+        logger.info(f"当前不在睡眠状态，{BOT_NAME}保持清醒。")
+
+
+def schedule_sleep_maintenance():
+    """在已有事件循环里异步补做睡眠维护（不阻塞消息收发）。
+
+    睡眠期间 NapCat 必须保持连接（要被 @ 唤醒），因此维护只能放到线程池里跑。
+    """
+    if not is_sleeping():
+        return
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        # 没有事件循环（如 CLI 路径），退化为同步执行
+        enter_sleep()
+        return
+    loop.run_in_executor(None, _sleep_maintenance_bg)
+
+
+def _sleep_maintenance_bg():
+    """线程池执行的睡眠维护，异常只记日志，不影响服务。
+
+    用 _sleep_maintenance_done 去重：同一觉只做一次，避免
+    drift_loop 与 start_server 两条路径重复全量落盘。
+    """
+    global _sleep_maintenance_done
+    if _sleep_maintenance_done:
+        return
+    _sleep_maintenance_done = True
     try:
         from utils.persistence import sleep_cleanup
         sleep_cleanup()
         logger.info("[睡眠维护] 链接剪枝、字词整理、全量保存已完成")
     except Exception as e:
         logger.error(f"[睡眠维护] 执行失败: {e}")
-
-def wake_up():
-    """从睡眠中唤醒"""
-    global _sleeping
-    _sleeping = False
-    logger.info(f"{BOT_NAME}醒来了！")
-
-def init_sleep_state():
-    """启动时调用，若生物钟判定处于睡眠则立即进入睡眠"""
-    if is_sleeping():
-        enter_sleep()
-    else:
-        logger.info(f"当前不在睡眠状态，{BOT_NAME}保持清醒。")
 
 # ---------- 消息处理核心 ----------
 async def handle_group_message(data: dict):
@@ -913,6 +961,10 @@ async def start_server():
     server = await websockets.serve(ws_handler, WS_HOST, WS_PORT)
     try:
         logger.info(f"WebSocket 服务器已启动，等待 NapCat 连接: ws://{WS_HOST}:{WS_PORT}{WS_PATH}")
+        # 服务器已就绪：此时补做睡眠维护，保证"启动即睡眠"也能被 @ 唤醒。
+        # 若在 start_server 之前做，这十几秒里 NapCat 连不上来。
+        if is_sleeping() and not _sleep_maintenance_done:
+            schedule_sleep_maintenance()
         await _shutdown_event.wait()
 
         # ========== 服务停止：优雅关停 ==========

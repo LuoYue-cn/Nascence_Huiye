@@ -289,13 +289,10 @@ class Biorhythm:
         if not self._replaying:
             self._decay_rhythm()
             self.rhythm_nights += 1
-        # 沿用现有睡眠全量维护（离线补算时不执行，避免启动开销与副作用）
-        if not self._replaying:
-            try:
-                from utils.persistence import sleep_cleanup
-                sleep_cleanup()
-            except Exception as e:
-                append_log(f"[生物钟] 睡眠维护失败: {e}")
+        # 注意：这里不做睡眠维护。tick 运行在事件循环线程里，
+        # 而睡眠维护要十几秒（全量落盘 + faiss 重建），同步执行会卡住
+        # 收消息与生物钟自身，导致被 @ 唤醒失效。维护由 qq_bot.enter_sleep
+        # 提交到线程池异步执行。
 
     def _wake_internal(self, now: float = None):
         if now is None:
