@@ -50,6 +50,10 @@ ONSET_THRESHOLD = 0.62
 WAKE_THRESHOLD = 0.20
 # 被用户点名唤醒后的清醒锁定时间（秒）：期间不会立刻重新睡去，以便完成回应
 AWAKE_LOCK = 20 * 60
+# 身体感受的注入窗口（秒）：只在刚醒来后的这段时间里注入"还很困"之类感受。
+# 与 AWAKE_LOCK 是两个概念——后者是"不许马上睡回去"的保护锁，
+# 这里限的是"刚醒多久还值得提一句身体状态"。
+WAKE_FEELING_WINDOW = 5 * 60
 # 单次 tick 最大推进步长（秒），用于离线补算时的数值稳定
 MAX_STEP = 300.0
 
@@ -352,35 +356,47 @@ class Biorhythm:
         """精力 → 思考深度系数 ∈ [0.5, 1.0]。低精力时想得浅。"""
         return 0.5 + 0.5 * self.energy
 
-    def feeling_text(self, min_interval: float = 900.0) -> str | None:
-        """按精力分档生成第一人称身体感受（纯字符串，不调 LLM）。
+    def feeling_text(self, min_interval: float = None) -> str | None:
+        """生成第一人称身体感受（纯字符串，不调 LLM）。
 
-        - 正常起床且精力充沛（energy >= 0.4）：返回 None，不产生多余记忆。
-        - 刚被叫醒（用户 @ 唤醒，处于清醒锁定窗口期）：体现被吵醒的迷糊状态。
-        - 仅在精力 < 0.4 时附加感受，且加 15 分钟 (900s) 冷却，绝不每轮重复洗脑。
+        只在**刚醒来后的几分钟**内注入，窗口之外一律返回 None：
+        身体感受是"刚醒时的残余状态"这一件事，不该一整天反复浮现。
+        此前只要精力低就持续注入，一天能刷出几十条近乎重复的记忆。
+
+        一觉只在窗口内提一次（用 last_feeling_time 记录并跨觉重置），
+        避免认知循环每几秒反复自我催眠。
         """
         now = time.time()
-        # 1. 处于被强行唤醒的锁定保护期
-        if self.woke_by_user and now < self.awake_until:
-            if now - self.last_feeling_time < min_interval:
-                return None
+        if not self._in_wake_window(now):
+            return None
+        # 本次醒来是否已提过一次。
+        # 用 last_feeling_time > last_wake 判定，但要留一点容差：
+        # 醒来与首次调用常在同一秒内发生，直接用 >= 会误判成"已提过"。
+        if self.last_feeling_time > (self.last_wake or 0) + 1e-6:
+            return None
+
+        # 被叫醒：睡到一半被外部打断，比自然醒更迷糊
+        if self.woke_by_user:
             self.last_feeling_time = now
             return "[现在] 我刚被吵醒，脑子还发懵，有点迷糊"
-
+        # 自然醒：按精力分档（睡饱则精力充沛，不产生感受）
         e = self.energy
-        # 2. 精力充沛正常状态：不附加任何感受记忆
         if e >= 0.4:
             return None
-
-        # 3. 冷却检查：疲倦感受 15 分钟内最多浮现一次，避免认知循环每 3 秒自我催眠
-        if now - self.last_feeling_time < min_interval:
-            return None
-
         self.last_feeling_time = now
-        # 4. 疲乏与濒临入睡状态（仅 < 0.4 时附加）
         if e >= 0.25:
-            return "[现在] 我挺累的，眼皮开始发沉，想找个地方歇一会儿"
-        return "[现在] 我快撑不住了，脑子迷迷糊糊的，只想睡觉"
+            return "[现在] 我刚醒，还有点没睡够，脑子不太清醒"
+        return "[现在] 我刚醒，头还是沉的，很困"
+
+    def _in_wake_window(self, now: float) -> bool:
+        """当前是否处于"刚醒来"的时间窗内。
+
+        用 last_wake 而非 awake_until 判定：awake_until 是唤醒后的
+        20 分钟保护锁（为保证回应完整），与"刚醒多久"是两回事。
+        """
+        if not self.last_wake:
+            return False
+        return (now - self.last_wake) <= WAKE_FEELING_WINDOW
 
     def snapshot(self) -> dict:
         return {
