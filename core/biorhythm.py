@@ -1,3 +1,4 @@
+from utils.paths import data_path
 # core/biorhythm.py
 """
 辉夜的生物钟（自塑造节律）。
@@ -35,7 +36,7 @@ import threading
 from utils.monitor import append_log
 from config.api_config import config
 
-STATE_FILE = "data/test/biorhythm.json"
+STATE_FILE = data_path("biorhythm.json")
 
 # ========== 动力学速率（量纲，非钟点）==========
 # 清醒时睡眠压力上升的指数时间常数（秒）→ 决定"醒着多久会困"
@@ -120,6 +121,9 @@ class Biorhythm:
         _load_params()
         self.load()
 
+    def configure(self):
+        with self._lock: _load_params()
+
     # ---------- 核心推进 ----------
     def tick(self, now: float = None):
         """按真实时间推进状态。可多次调用，等价于一次长推进。"""
@@ -160,7 +164,8 @@ class Biorhythm:
             return 0.0
         if ts is None:
             ts = time.time()
-        hour = int((ts % 86400) / 3600) % 24
+        from core.virtual_clock import clock
+        hour = clock.local_datetime(ts).hour
         peak = max(self.rhythm_hist)
         if peak <= 0:
             return 0.0
@@ -247,7 +252,8 @@ class Biorhythm:
         if self._last_rhythm_sample is not None and (now - self._last_rhythm_sample) < RHYTHM_SAMPLE_INTERVAL:
             return
         self._last_rhythm_sample = now
-        hour = int((now % 86400) / 3600) % 24
+        from core.virtual_clock import clock
+        hour = clock.local_datetime(now).hour
         self.rhythm_hist[hour] += 1.0
         self.rhythm_total += 1.0
 
@@ -295,7 +301,7 @@ class Biorhythm:
             self.rhythm_nights += 1
         # 注意：这里不做睡眠维护。tick 运行在事件循环线程里，
         # 而睡眠维护要十几秒（全量落盘 + faiss 重建），同步执行会卡住
-        # 收消息与生物钟自身，导致被 @ 唤醒失效。维护由 qq_bot.enter_sleep
+        # 收消息与生物钟自身，导致被 @ 唤醒失效。维护由 Runtime 的协调器
         # 提交到线程池异步执行。
 
     def _wake_internal(self, now: float = None):
@@ -433,10 +439,8 @@ class Biorhythm:
                 "rhythm_total": self.rhythm_total,
                 "by_rhythm": self._by_rhythm,
             }
-            tmp = STATE_FILE + ".tmp"
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-            os.replace(tmp, STATE_FILE)
+            from utils.paths import atomic_json
+            atomic_json(STATE_FILE,data)
 
     def load(self):
         with self._lock:

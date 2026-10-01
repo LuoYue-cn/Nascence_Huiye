@@ -1,334 +1,115 @@
-# utils/persistence.py
+"""SQLite is authoritative. Snapshots are disposable exports, not recovery gates."""
 import json
 import os
-import threading
 import time
-from core.memory_engine import memories, links, pending_deletion, wordweb, hot_ids
-from core.memory_engine import check_and_handle_expired, _evict_cold_memories
-from core.virtual_clock import clock
+from utils.paths import data_path, atomic_json
+from core import memory_engine as me
 
-_io_lock = threading.Lock()
-
-# 保存节流：关停路径上 QQ 服务与面板会各保存一次，短时间内的重复调用只是重做同样的落盘。
-# 小于该间隔的重复保存直接跳过；关停时用 save_all_data(force=True) 保证最后一次一定落盘。
+_io_lock = me._data_lock  # One reentrant order for save and sleep maintenance.
+MEMORY_FILE = data_path('memory.json')
+STATE_FILE = data_path('dialogue_state.json')
+FAISS_INDEX_FILE = data_path('faiss.index')
+FAISS_MAPPING_FILE = data_path('faiss_mapping.json')
+METRICS_COUNTERS_FILE = data_path('metrics_counters.json')
+DIALOGUE_LOG_FILE = data_path('dialogue_log.jsonl')
 _SAVE_MIN_INTERVAL = 3.0
 _last_save_time = 0.0
-_save_count = 0                # 统计实际执行的保存次数（供测试与观测）
+_save_count = 0
 
-MEMORY_FILE = "data/test/memory.json"
-STATE_FILE = "data/test/dialogue_state.json"
-DIALOGUE_LOG_FILE = "data/test/dialogue_log.jsonl"
-FAISS_INDEX_FILE = "data/test/faiss.index"
-FAISS_MAPPING_FILE = "data/test/faiss_mapping.json"
-METRICS_COUNTERS_FILE = "data/test/metrics_counters.json"
+def _metadata(key, value=None):
+    db = me._get_db()
+    if value is not None:
+        db.execute('INSERT OR REPLACE INTO core_metadata VALUES(?,?)', (key, json.dumps(value, ensure_ascii=False)))
+        db.commit()
+    row = db.execute('SELECT value FROM core_metadata WHERE key=?', (key,)).fetchone()
+    return json.loads(row[0]) if row else None
 
-# ========== 记忆持久化 ==========
-
-def save_all_data(force: bool = False) -> bool:
-    """保存记忆和链接到文件（原子写入，双锁保护避免并发下沉冲突）。
-
-    force=False 时做节流：距上次保存不足 _SAVE_MIN_INTERVAL 秒则跳过，
-    避免关停等路径上重复执行同一份落盘。返回是否真正执行了保存。
-    """
+def save_all_data(force=False):
     global _last_save_time, _save_count
     with _io_lock:
-        now = time.time()
-        if not force and (now - _last_save_time) < _SAVE_MIN_INTERVAL:
+        now = time.monotonic()
+        if not force and now - _last_save_time < _SAVE_MIN_INTERVAL:
             return False
-        _last_save_time = now
-        _save_count += 1
         _do_save_all_data()
+        _last_save_time = time.monotonic()  # Advance only after a successful save.
+        _save_count += 1
         return True
 
-
 def _do_save_all_data():
-    """实际执行保存（调用方需持有 _io_lock）。"""
-    from core.memory_engine import _data_lock, _get_db, hot_ids, memories
-    with _data_lock:
-        db = _get_db()
-        update_params = []
-        for mid in list(hot_ids):
-            mem = memories.get(mid)
-            if mem:
-                creation = mem.get("creation_time", mem.get("last_accessed", 0.0))
-                strengthen = mem.get("last_strengthen_time", creation)
-                update_params.append((
-                    mem.get("last_accessed", 0.0),
-                    mem.get("half_life", 172800),
-                    strengthen,
-                    mid
-                ))
-        if update_params:
-            db.executemany(
-                "UPDATE memories SET last_accessed=?, half_life=?, last_strengthen_time=? WHERE id=?",
-                update_params
-            )
-            db.commit()
-
-        os.makedirs("data/test", exist_ok=True)
-        serializable_sentence_links = {f"{src}||{tgt}": val for (src, tgt), val in list(links.items())}
-        serializable_word_links = {f"{a}||{b}": val for (a, b), val in list(wordweb.items())}
-        data = {
-            "memories": {mid: memories[mid] for mid in list(hot_ids) if mid in memories},
-            "links": serializable_sentence_links,
-            "wordweb": serializable_word_links,
-        }
-        tmp_file = MEMORY_FILE + ".tmp"
-        with open(tmp_file, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        os.replace(tmp_file, MEMORY_FILE)
-
-        # 热链接增量下沉到 SQLite（只写本轮发生变化的行）
-        from core.memory_engine import _sync_all_links_to_sqlite
-        _sync_all_links_to_sqlite()
-
-        clock.save_state()
-
-        from core.memory_engine import _faiss_index, _faiss_to_mem
-        import faiss
-        faiss.write_index(_faiss_index, FAISS_INDEX_FILE)
-        with open(FAISS_MAPPING_FILE, 'w', encoding='utf-8') as f:
-            json.dump(_faiss_to_mem, f, ensure_ascii=False)
-
-    # 保存每日指标计数器快照
-    from core.memory_engine import _export_metrics_counters
-    metrics = _export_metrics_counters()
-    with open(METRICS_COUNTERS_FILE, 'w', encoding='utf-8') as f:
-        json.dump(metrics, f, ensure_ascii=False)
-
-    # 保存生物钟状态（精力/睡眠压力/睡眠债）
-    try:
-        from core.biorhythm import BIORHYTHM
-        BIORHYTHM.save()
-    except Exception:
-        pass
+    me._sync_all_links_to_sqlite()
+    _metadata('wordweb', {f'{a}||{b}': val for (a,b),val in me.wordweb.items()})
+    _metadata('metrics', me._export_metrics_counters())
+    me._get_db().execute('PRAGMA wal_checkpoint(PASSIVE)')
+    atomic_json(MEMORY_FILE, {
+        'memories': {mid: me.memories[mid] for mid in me.hot_ids if mid in me.memories},
+        'links': {f'{a}||{b}': v for (a,b),v in me.links.items()},
+        'wordweb': {f'{a}||{b}': v for (a,b),v in me.wordweb.items()},
+    })
+    from core.biorhythm import BIORHYTHM
+    BIORHYTHM.save()
+    from utils.message_history import flush_to_file
+    flush_to_file()
 
 def load_all_data():
-    """从文件加载记忆和链接"""
-    global memories, links
     with _io_lock:
-        if not os.path.exists(MEMORY_FILE):
-            return
-        with open(MEMORY_FILE, 'r', encoding='utf-8-sig') as f:
-            data = json.load(f)
-        memories.clear()
-        from core.memory_engine import hot_ids
-        hot_ids.clear()
-        memories.update(data.get("memories", {}))
-        hot_ids.update(memories.keys())
-        links.clear()
-        for key_str, val in data.get("links", {}).items():
-            src, tgt = key_str.split("||")
-            links[(src, tgt)] = val
-        wordweb.clear()
-        for key_str, val in data.get("wordweb", {}).items():
-            a, b = key_str.split("||")
-            wordweb[(a, b)] = val
-        from core.memory_engine import _build_word_to_memories
-        _build_word_to_memories()
-
-        # faiss持久化
-        from core.memory_engine import (
-            _faiss_index, _faiss_to_mem, _mem_to_faiss,
-            _init_faiss_index, _rebuild_faiss_index
-        )
-        import faiss
-        if os.path.exists(FAISS_INDEX_FILE) and os.path.exists(FAISS_MAPPING_FILE):
-            # 读取索引
-            _faiss_index_global = faiss.read_index(FAISS_INDEX_FILE)
-            # 读取映射表
-            with open(FAISS_MAPPING_FILE, 'r', encoding='utf-8-sig') as f:
-                loaded_mapping = json.load(f)
-            # 验证长度一致性
-            if len(loaded_mapping) == _faiss_index_global.ntotal:
-                # 赋值给全局变量
-                import core.memory_engine as me
-                me._faiss_index = _faiss_index_global
-                me._faiss_to_mem = loaded_mapping
-                # 重建反向映射
-                me._mem_to_faiss = {mem_id: idx for idx, mem_id in enumerate(loaded_mapping)}
+        db = me._get_db()
+        # JSON-only legacy stores must be migrated explicitly before runtime readiness.
+        me.memories.clear(); me.hot_ids.clear(); me.links.clear()
+        rows = db.execute('SELECT * FROM memories ORDER BY last_accessed DESC LIMIT ?', (me.MAX_HOT_SIZE,)).fetchall()
+        for row in rows:
+            mem = me._row_to_memory(row)
+            me.memories[mem['id']] = mem; me.hot_ids.add(mem['id'])
+        me._dirty_links.clear(); me._deleted_links.clear()
+        me._build_word_to_memories()
+        me._rebuild_faiss_index()  # Includes commits made after any old cache snapshot.
+        me.wordweb.clear()
+        for key, value in (_metadata('wordweb') or {}).items():
+            a,b = key.split('||',1); me.wordweb[(a,b)] = value
+        metrics = _metadata('metrics')
+        if metrics is None:
+            if os.path.exists(METRICS_COUNTERS_FILE):
+                with open(METRICS_COUNTERS_FILE, encoding='utf-8-sig') as f:
+                    metrics = json.load(f)
             else:
-                print("[持久化] faiss 索引与映射表不一致，将全量重建索引")
-                _rebuild_faiss_index()
-        else:
-            # 没有 faiss 文件，可能是首次运行或旧版本，全量重建
-            print("[持久化] 未找到 faiss 文件，全量重建索引")
-            _rebuild_faiss_index()
-        
-        if os.path.exists(METRICS_COUNTERS_FILE):
-            with open(METRICS_COUNTERS_FILE, 'r', encoding='utf-8-sig') as f:
-                metrics = json.load(f)
-            from core.memory_engine import _import_metrics_counters
-            _import_metrics_counters(metrics)
-
-        # 限制热记忆数量到硬上限（MAX_HOT_SIZE），把最久未访问的记忆移出内存
-        from core.memory_engine import _evict_cold_memories, _evict_cold_links
-        _evict_cold_memories()
-        _evict_cold_links()
-
-        # 加载生物钟状态（按离线真实时长补算）
-        try:
-            from core.biorhythm import BIORHYTHM
-            BIORHYTHM.load()
-        except Exception:
-            pass
-
-# ========== 对话状态持久化 ==========
+                me._init_metrics_counters()
+        if metrics is not None:
+            me._import_metrics_counters(metrics)
+        from core.biorhythm import BIORHYTHM
+        BIORHYTHM.load()
+        from core.concept_store import reload_from_db
+        reload_from_db()
 
 def save_state():
-    """保存对话状态到 JSON 文件"""
+    from utils.dialogue_state import export_states
     with _io_lock:
-        os.makedirs("data/test", exist_ok=True)
-        with open(STATE_FILE, 'w', encoding='utf-8') as f:
-            from utils.dialogue_state import current_state
-            json.dump(current_state, f, ensure_ascii=False, indent=2)
+        _metadata('dialogue_states', export_states())
 
 def load_state():
-    if not os.path.exists(STATE_FILE):
-        return
-    try:
-        with open(STATE_FILE, 'r', encoding='utf-8-sig') as f:
-            loaded = json.load(f)
-        # 标准化键名，仅保留在用的状态键；历史遗留的“已知信息”类字段直接丢弃
-        normalized = {}
-        for key, value in loaded.items():
-            if key in ("参与者", "最近话题"):
-                normalized[key] = value
-        # 更新状态，不清空，防止空覆盖
-        if normalized:
-            from utils.dialogue_state import current_state
-            current_state.update(normalized)
-        print(f"[状态加载] 加载内容: {normalized}")
-    except Exception as e:
-        print(f"[状态加载] 加载失败: {e}")
-
-def append_dialogue(user_input: str, bot_reply: str):
-    """追加一轮对话到日志文件（不读入内存）"""
-    record = {
-        "time": time.time(),          # 真实时间戳
-        "virtual_time": clock.now(),  # 虚拟时间戳
-        "user": user_input,
-        "bot": bot_reply
-    }
+    from utils.dialogue_state import import_states
     with _io_lock:
-        os.makedirs("data/test", exist_ok=True)
-        with open(DIALOGUE_LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        import_states(_metadata('dialogue_states') or {})
 
-# ========== 睡眠清理 ==========
 def sleep_cleanup():
-    """
-    睡眠巩固阶段的全量维护（当前版本已恢复物理删除）：
-    1. 剪枝权重过低的链接
-    2. 整理字词网络（衰减 + 剪枝）
-    3. 物理删除衰变到极致的记忆
-    4. 全量持久化（含重建 faiss 索引）
-    """
-    from core.memory_engine import _data_lock
-    with _data_lock:
-        now = clock.now()
-        removed_links = 0
-        removed_wordweb = 0
-
-        # 1. 链接剪枝（内存热链接）
-        dead_links = []
-        for key, data in list(links.items()):
-            delta = now - data.get("last_accessed", data.get("creation_time", now))
-            decay = 2 ** (-delta / (7 * 24 * 3600))  # LINK_HALF_LIFE
-            if data["weight"] * decay < 0.01:
-                dead_links.append(key)
-        for key in dead_links:
-            del links[key]
-            removed_links += 1
-            from core.memory_engine import _bump_link_deleted, _deleted_links, _dirty_links
-            _dirty_links.discard(key)
-            _deleted_links.add(key)
-            _bump_link_deleted()
-        # 剪枝 SQLite 中已下沉的冷链接（不在内存中的）
-        from core.memory_engine import _get_db
-        _cold_db = _get_db()
-        _cold_rows = _cold_db.execute(
-            "SELECT src, tgt, weight, last_accessed, creation_time FROM links"
-        ).fetchall()
-        _cold_dead = []
-        for src, tgt, weight, last_accessed, creation_time in _cold_rows:
-            if (src, tgt) in links:
-                continue  # 热链接跳过，交给内存管理
-            _delta = now - (last_accessed or creation_time or now)
-            if weight * (2 ** (-_delta / (7 * 24 * 3600))) < 0.01:
-                _cold_dead.append((src, tgt))
-        for src, tgt in _cold_dead:
-            _cold_db.execute("DELETE FROM links WHERE src = ? AND tgt = ?", (src, tgt))
-            removed_links += 1
-            from core.memory_engine import _bump_link_deleted
-            _bump_link_deleted()
-        _cold_db.commit()
-
-        # 2. 字词网络剪枝（衰减后共现次数过低则删除）
-        dead_words = []
-        for (a, b), wdata in list(wordweb.items()):
-            delta = now - wdata.get("last_updated", now)
-            decay = 2 ** (-delta / (7 * 24 * 3600))
-            if wdata["forward_count"] * decay < 0.5:
-                dead_words.append((a, b))
-        for key in dead_words:
-            del wordweb[key]
-            removed_wordweb += 1
-
-        # 3. 物理删除衰变记忆，并重建 faiss 索引
-        from core.memory_engine import _purge_expired_memories, _rebuild_faiss_index
-        expired = _purge_expired_memories()
+    with _io_lock:
+        me._sync_all_links_to_sqlite()
+        expired = me._purge_expired_memories()
         if expired:
-            _rebuild_faiss_index()          # faiss 全量重建（从 SQLite 剩余记忆重新构建）
-            print(f"[睡眠维护] 物理删除 {len(expired)} 条衰变记忆，faiss 索引已重建")
-
-        # 3.5 冷记忆淘汰：将超出热记忆上限的最久未访问记忆移出内存（写入 SQLite）
-        from core.memory_engine import _evict_cold_memories, _evict_cold_links
-        _evict_cold_memories()
-        _evict_cold_links()
-
-        # 4. 全量持久化（含热数据写入 JSON、faiss 索引、时钟状态）
-        save_all_data()
-        print(f"[睡眠维护] 链接剪枝 {removed_links}，字词清理 {removed_wordweb}，物理删除 {len(expired)} 条记忆")
-
-        from core.memory_engine import _write_daily_metrics
-        _write_daily_metrics()
-
-# ========== 临时数据迁移（将json导入SQLite） ==========
-def migrate_json_to_sqlite():
-    """将旧的 memory.json 中的所有记忆导入 SQLite，然后删除 JSON 文件"""
-    if not os.path.exists(MEMORY_FILE):
-        return
-    from core.memory_engine import _get_db, _faiss_index, _faiss_to_mem, _mem_to_faiss
-    import faiss, numpy as np
-    with open(MEMORY_FILE, 'r', encoding='utf-8-sig') as f:
-        data = json.load(f)
-    db = _get_db()
-    for mem_id, mem in data.get("memories", {}).items():
-        # 插入 SQLite
-        db.execute(
-            """INSERT OR REPLACE INTO memories (id, content, vector, half_life, last_accessed,
-               creation_time, last_strengthen_time, concept_tag_ids)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (mem_id, mem["content"], np.array(mem["vector"], dtype=np.float32).tobytes(),
-             mem["half_life"], mem["last_accessed"], mem["creation_time"],
-             mem.get("last_strengthen_time", mem["creation_time"]),
-             json.dumps(mem.get("concept_tag_ids", [])))
-        )
-    # 迁移链接到 SQLite links 表
-    for key_str, val in data.get("links", {}).items():
-        src, tgt = key_str.split("||")
-        db.execute(
-            """INSERT OR REPLACE INTO links (src, tgt, weight, type, last_accessed, creation_time)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (src, tgt, val.get("weight", 0.0), val.get("type", "semantic"),
-             val.get("last_accessed", val.get("creation_time", 0)),
-             val.get("creation_time", 0))
-        )
-    db.commit()
-    # 重建 faiss 索引（确保与 SQLite 一致）
-    from core.memory_engine import _rebuild_faiss_index
-    _rebuild_faiss_index()
-    # 删除旧 JSON 文件
-    os.remove(MEMORY_FILE)
-    print("[迁移] JSON 数据已全部迁移至 SQLite，faiss 索引已重建。")
+            me._rebuild_faiss_index()
+        now = time.time()
+        for key, data in list(me.links.items()):
+            if data.get('time_basis')!='unix_utc': continue
+            if data['weight'] * me.time_decay(max(0,now-data.get('last_accessed',now)), me.LINK_HALF_LIFE) < .01:
+                del me.links[key]; me._dirty_links.discard(key); me._deleted_links.add(key); me._bump_link_deleted()
+        db = me._get_db()
+        for src,tgt,weight,access in db.execute("SELECT src,tgt,weight,last_accessed FROM links WHERE time_basis='unix_utc'").fetchall():
+            if weight * me.time_decay(max(0,now-access),me.LINK_HALF_LIFE) < .01:
+                db.execute('DELETE FROM links WHERE src=? AND tgt=?',(src,tgt))
+        db.commit()
+        for key,val in list(me.wordweb.items()):
+            if val.get('time_basis')!='unix_utc': continue
+            if val['forward_count'] * me.time_decay(max(0,now-val['last_updated']),me.LINK_HALF_LIFE) < .5:
+                del me.wordweb[key]
+        me._evict_cold_memories(); me._evict_cold_links()
+        save_all_data(force=True)
+        me._write_daily_metrics()
+        return {'expired': len(expired)}

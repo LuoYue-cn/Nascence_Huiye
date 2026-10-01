@@ -1,127 +1,34 @@
-#!/bin/bash
-# ============================================================
-# Nascence 辉夜 一键启动脚本
-# 所有环境/文件均位于项目文件夹内，不污染系统环境
-# ============================================================
-
-set -e
-
-PROJECT_DIR="$(cd "$(dirname "$0")" && pwd)"
-cd "$PROJECT_DIR"
-
-echo "=========================================="
-echo "  Nascence 辉夜 - 启动中..."
-echo "=========================================="
-
-# ---------- 1. 检查 venv ----------
-if [ ! -f "venv/bin/python3" ]; then
-    echo "[!] 虚拟环境未找到，正在创建..."
-    python3 -m venv venv --without-pip
-    source venv/bin/activate
-    curl -sS https://bootstrap.pypa.io/get-pip.py | python3 > /dev/null 2>&1
-    pip install -r requirements.txt -q -i https://mirrors.huaweicloud.com/repository/pypi/simple/ \
-        || { echo "[!] 华为源安装失败，尝试切换清华源..."; pip install -r requirements.txt -q -i https://pypi.tuna.tsinghua.edu.cn/simple \
-             || { echo "[!] 清华源安装失败，尝试使用默认源（Python 官方源）..."; pip install -r requirements.txt -q -i https://pypi.org/simple/; }; }
-    echo "[√] 虚拟环境已创建，依赖已安装"
-else
-    echo "[√] 虚拟环境正常"
-fi
-
-source venv/bin/activate
-
-# ---------- 2. 确保数据目录 ----------
-mkdir -p data/test
-
-# ---------- 3. 启动 Ollama ----------
-OLLAMA_BIN="$PROJECT_DIR/ollama/bin/ollama"
-OLLAMA_PID=""
-
-start_ollama() {
-    if [ -f "$OLLAMA_BIN" ]; then
-        export OLLAMA_HOME="$PROJECT_DIR/ollama/home"
-        mkdir -p "$OLLAMA_HOME"
-        
-        # 检查是否已有 Ollama 在运行
-        if curl -s http://localhost:11434/api/tags > /dev/null 2>&1; then
-            echo "[√] Ollama 服务已在运行"
-            return 0
-        fi
-        
-        echo "[*] 启动本地 Ollama 服务..."
-        "$OLLAMA_BIN" serve > /dev/null 2>&1 &
-        OLLAMA_PID=$!
-        
-        # 等待 Ollama 就绪
-        for i in $(seq 1 30); do
-            if curl -s http://localhost:11434/api/tags > /dev/null 2>&1; then
-                echo "[√] Ollama 服务已就绪"
-                return 0
-            fi
-            sleep 1
-        done
-        echo "[!] Ollama 启动超时"
-        return 1
-    else
-        echo "[!] Ollama 二进制未找到 ($OLLAMA_BIN)"
-        echo "[!] 请确保系统已安装 Ollama 或重新运行 setup.sh"
-        return 1
-    fi
-}
-
-start_ollama || echo "[!] Ollama 启动失败，请手动启动"
-
-# ---------- 4. 检查并拉取 Embedding 模型 ----------
-if curl -s http://localhost:11434/api/tags > /dev/null 2>&1; then
-    MODEL="shaw/dmeta-embedding-zh"
-    if ! curl -s http://localhost:11434/api/tags | grep -q "dmeta-embedding-zh"; then
-        echo "[*] 正在拉取 Embedding 模型: $MODEL ..."
-        curl -s -X POST http://localhost:11434/api/pull -d "{\"model\":\"$MODEL\"}" > /dev/null 2>&1
-        echo "[√] Embedding 模型已就绪"
-    else
-        echo "[√] Embedding 模型已存在"
-    fi
-fi
-
-# ---------- 5. 启动模式选择 ----------
+#!/usr/bin/env bash
+set -euo pipefail
+TASK_ROOT="$(cd "$(dirname "$0")" && pwd)"
+cd "$TASK_ROOT"
+test -x venv/bin/python || { echo 'Run bash setup.sh first.' >&2; exit 1; }
+test -f frontend/dist/index.html || { echo 'Build the panel with npm ci --prefix frontend && npm run build --prefix frontend.' >&2; exit 1; }
+export OLLAMA_MODELS="${OLLAMA_MODELS:-$TASK_ROOT/ollama/models}"
+TASK_OLLAMA_PID=''
+TASK_APP_PID=''
 cleanup() {
-    echo ""
-    echo "[*] 正在关闭服务..."
-    if [ -n "$OLLAMA_PID" ]; then
-        kill "$OLLAMA_PID" 2>/dev/null || true
-    fi
-    echo "[√] 已退出"
-    exit 0
+  if [ -n "$TASK_APP_PID" ]; then kill -TERM "$TASK_APP_PID" 2>/dev/null || true; wait "$TASK_APP_PID" 2>/dev/null || true; fi
+  if [ -n "$TASK_OLLAMA_PID" ]; then kill "$TASK_OLLAMA_PID" 2>/dev/null || true; wait "$TASK_OLLAMA_PID" 2>/dev/null || true; fi
 }
-trap cleanup SIGINT SIGTERM
-
-echo ""
-echo "=========================================="
-echo "  请选择启动模式:"
-echo "    1) CLI 命令行交互模式 (main.py)"
-echo "    2) QQ Bot 模式 (qq_bot.py)"
-echo "    3) 自我训练模式 (self_training.py)"
-echo "=========================================="
-echo ""
-read -p "输入选择 (1/2/3，默认 1): " MODE_CHOICE
-MODE_CHOICE=${MODE_CHOICE:-1}
-
-case "$MODE_CHOICE" in
-    1)
-        echo "[*] 启动 CLI 模式..."
-        python3 main.py
-        ;;
-    2)
-        echo "[*] 启动 QQ Bot 模式..."
-        python3 qq_bot.py
-        ;;
-    3)
-        echo "[*] 启动自我训练模式..."
-        python3 self_training.py
-        ;;
-    *)
-        echo "[!] 无效选择，启动 CLI 模式..."
-        python3 main.py
-        ;;
-esac
-
-cleanup
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+TASK_URL="$(venv/bin/python -c 'from config.api_config import config; print(config["ollama_base_url"].rstrip("/"))')"
+if [[ "$TASK_URL" = http://localhost:11434 || "$TASK_URL" = http://127.0.0.1:11434 ]]; then
+  if ! curl --fail --silent --max-time 2 "$TASK_URL/api/tags" >/dev/null && [ -x ollama/bin/ollama ]; then
+    mkdir -p ollama
+    ollama/bin/ollama serve >ollama/service.log 2>&1 &
+    TASK_OLLAMA_PID=$!
+    for _ in $(seq 1 30); do
+      if curl --fail --silent --max-time 2 "$TASK_URL/api/tags" >/dev/null; then break; fi
+      if ! kill -0 "$TASK_OLLAMA_PID" 2>/dev/null; then break; fi
+      sleep 1
+    done
+  fi
+fi
+# Management remains accessible when model dependencies are unavailable.
+venv/bin/python main.py "$@" &
+TASK_APP_PID=$!
+wait "$TASK_APP_PID"
+TASK_APP_PID=''

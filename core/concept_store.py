@@ -1,3 +1,5 @@
+from config.api_config import config
+from utils.paths import data_path
 # core/concept_store.py
 # ========================================================================
 # 概念层：把记忆组织成「概念 → 事件段 → 记忆成员」三级结构，供定向检索。
@@ -31,9 +33,10 @@ import faiss
 import numpy as np
 
 from utils.monitor import append_log
+from utils.session_context import current_group
 
-DB_FILE = "data/test/memory.db"
-EMBED_DIM = 768
+DB_FILE = data_path("memory.db")
+EMBED_DIM = int(config.get("embedding_dimension", 768))
 
 # 事件段双重切分参数
 EPISODE_GAP = 120.0        # 段内相邻记忆的真实时间间隔上限（秒）
@@ -74,9 +77,8 @@ def _get_db():
     global _db_conn
     if _db_conn is None:
         os.makedirs(os.path.dirname(DB_FILE), exist_ok=True)
-        _db_conn = sqlite3.connect(DB_FILE, check_same_thread=False)
-        _db_conn.execute("PRAGMA journal_mode=WAL")
-        _db_conn.execute("PRAGMA synchronous=NORMAL")
+        from .memory_engine import _get_db as memory_db
+        _db_conn = memory_db()
         _db_conn.execute("""
             CREATE TABLE IF NOT EXISTS concepts (
                 id TEXT PRIMARY KEY,
@@ -100,6 +102,14 @@ def _get_db():
             )
         """)
         _db_conn.execute("CREATE INDEX IF NOT EXISTS idx_events_concept ON concept_events(concept_id)")
+        for table, columns in {
+            'concepts': {'scope': "TEXT DEFAULT 'legacy_unattributed'", 'group_id': 'TEXT'},
+            'concept_events': {'time_basis': "TEXT DEFAULT 'legacy_unknown'"},
+        }.items():
+            existing = {r[1] for r in _db_conn.execute(f'PRAGMA table_info({table})')}
+            for name, ddl in columns.items():
+                if name not in existing:
+                    _db_conn.execute(f'ALTER TABLE {table} ADD COLUMN {name} {ddl}')
         _db_conn.commit()
     return _db_conn
 
@@ -122,9 +132,11 @@ def _ensure_faiss():
 def _rebuild_concept_faiss():
     """从 SQLite 全量重建概念索引（启动时调用一次）。"""
     db = _get_db()
+    _init_concept_faiss()
     rows = db.execute("SELECT id, vector FROM concepts").fetchall()
     for cid, blob in rows:
-        vec = np.frombuffer(blob, dtype=np.float32).reshape(1, -1)
+        from .memory_engine import validate_vector
+        vec = validate_vector(np.frombuffer(blob, dtype=np.float32)).reshape(1, -1)
         faiss.normalize_L2(vec)
         _concept_faiss.add(vec)
         _concept_to_faiss[cid] = _concept_faiss.ntotal - 1
@@ -138,7 +150,8 @@ def _embed(text: str):
     """取文本向量并归一化（供内积索引当余弦用）。失败返回 None。"""
     from .memory_engine import text_to_vector
     try:
-        vec = np.array(text_to_vector(text), dtype=np.float32).reshape(1, -1)
+        from .memory_engine import validate_vector
+        vec = validate_vector(text_to_vector(text)).reshape(1, -1)
     except Exception as e:
         append_log(f"[概念层] 向量化失败: {e}")
         return None
@@ -150,16 +163,27 @@ def _embed(text: str):
 
 
 # ---------- 概念查重 ----------
-def find_similar_concept(vec) -> tuple:
-    """在概念索引中找最相似概念，返回 (concept_id, score)；无概念时 (None, 0.0)。"""
-    with _lock:
-        idx = _ensure_faiss()
-        if idx.ntotal == 0:
-            return None, 0.0
-        scores, ids = idx.search(vec, 1)
-        if ids[0][0] == -1:
-            return None, 0.0
-        return _faiss_to_concept[ids[0][0]], float(scores[0][0])
+def _scope_clause(exact=False):
+    group = current_group.get()
+    if group is None:
+        return ("scope='persona_shared'", ()) if exact else ("1=1", ())
+    if exact:
+        return "scope='group' AND group_id=?", (group,)
+    return "(scope='persona_shared' OR (scope='group' AND group_id=?))", (group,)
+
+
+def find_similar_concept(vec, exact_scope=False):
+    clause, params = _scope_clause(exact_scope)
+    rows = _get_db().execute(f"SELECT id, vector FROM concepts WHERE {clause}", params).fetchall()
+    if not rows:
+        return None, 0.0
+    from .memory_engine import validate_vector
+    matrix = np.stack([validate_vector(np.frombuffer(r[1], dtype=np.float32)) for r in rows])
+    faiss.normalize_L2(matrix)
+    index = faiss.IndexFlatIP(EMBED_DIM)
+    index.add(matrix)
+    scores, ids = index.search(vec, 1)
+    return rows[int(ids[0][0])][0], float(scores[0][0])
 
 
 # ---------- 事件段 ----------
@@ -268,8 +292,8 @@ def _insert_events(concept_id: str, segments: list) -> list:
     for members, start, end in segments:
         eid = str(uuid.uuid4())
         db.execute(
-            "INSERT INTO concept_events (id, concept_id, member_ids, start_time, end_time) "
-            "VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO concept_events (id, concept_id, member_ids, start_time, end_time, time_basis) "
+            "VALUES (?, ?, ?, ?, ?, 'unix_utc')",
             (eid, concept_id, json.dumps(members, ensure_ascii=False), start, end),
         )
         new_ids.append(eid)
@@ -278,7 +302,7 @@ def _insert_events(concept_id: str, segments: list) -> list:
 
 
 # ---------- 概念写入 ----------
-def record_concept(concept_name: str, member_ids: list, timestamp: float = None) -> str | None:
+def record_concept(concept_name: str, member_ids: list, timestamp: float = None, *, vector=None) -> str | None:
     """把一批记忆归入某个概念；必要时新建概念。
 
     concept_name 为空或成员为空时不做任何事（该批记忆不入概念层，
@@ -293,13 +317,16 @@ def record_concept(concept_name: str, member_ids: list, timestamp: float = None)
 
     name = str(concept_name).strip()
     now = time.time() if timestamp is None else float(timestamp)
-    vec = _embed(name)
+    vec = _embed(name) if vector is None else np.asarray(vector, dtype=np.float32).reshape(1,-1)
     if vec is None:
         return None
+    from .memory_engine import validate_vector
+    vec=validate_vector(np.asarray(vec).reshape(-1)).reshape(1,-1)
+    faiss.normalize_L2(vec)
 
     with _lock:
         db = _get_db()
-        cid, score = find_similar_concept(vec)
+        cid, score = find_similar_concept(vec, exact_scope=True)
 
         if cid is not None and score >= CONCEPT_MERGE_THRESHOLD:
             # 归并进已有概念：追加时间戳与事件段，不替换、不丢内容
@@ -330,8 +357,9 @@ def record_concept(concept_name: str, member_ids: list, timestamp: float = None)
         cid = str(uuid.uuid4())
         db.execute(
             "INSERT INTO concepts (id, name, vector, event_ids, occurrences, total_count, "
-            "member_count, creation_time, last_accessed) VALUES (?, ?, ?, '[]', ?, 1, ?, ?, ?)",
-            (cid, name, vec.tobytes(), json.dumps([now]), len(member_ids), now, now),
+            "member_count, creation_time, last_accessed, scope, group_id) VALUES (?, ?, ?, '[]', ?, 1, ?, ?, ?, ?, ?)",
+            (cid, name, vec.tobytes(), json.dumps([now]), len(member_ids), now, now,
+             "group" if current_group.get() is not None else "persona_shared", current_group.get()),
         )
         db.commit()
         segments = _segment_members(cid, member_ids, now)
@@ -397,18 +425,19 @@ def match_concept(query: str) -> tuple:
     q = str(query).strip()
     with _lock:
         db = _get_db()
+        clause, scope_params = _scope_clause()
         # 1) 精确名匹配：概念名包含查询词，或查询词包含概念名
         row = db.execute(
-            "SELECT id, name FROM concepts WHERE name = ? OR name LIKE ? "
+            f"SELECT id, name FROM concepts WHERE {clause} AND (name = ? OR name LIKE ?) "
             "ORDER BY last_accessed DESC LIMIT 1",
-            (q, f"%{q}%"),
+            (*scope_params, q, f"%{q}%"),
         ).fetchone()
         if row:
             return row[0], row[1], "exact"
         row = db.execute(
-            "SELECT id, name FROM concepts WHERE ? LIKE '%' || name || '%' "
+            f"SELECT id, name FROM concepts WHERE {clause} AND ? LIKE '%' || name || '%' "
             "ORDER BY last_accessed DESC LIMIT 1",
-            (q,),
+            (*scope_params, q),
         ).fetchone()
         if row:
             return row[0], row[1], "reverse"
@@ -432,8 +461,11 @@ def select_episodes(concept_id: str, time_intent: str = "none",
     筛选为空时降级为"最近若干段"，保证辉夜仍有材料可回应。
     """
     db = _get_db()
+    clause, params = _scope_clause()
+    if not db.execute(f"SELECT 1 FROM concepts WHERE id=? AND {clause}", (concept_id, *params)).fetchone():
+        return [], False
     rows = db.execute(
-        "SELECT id, member_ids, start_time, end_time FROM concept_events "
+        "SELECT id, member_ids, start_time, end_time, time_basis FROM concept_events "
         "WHERE concept_id = ? ORDER BY end_time DESC",
         (concept_id,),
     ).fetchall()
@@ -446,7 +478,7 @@ def select_episodes(concept_id: str, time_intent: str = "none",
             members = json.loads(r[1]) if r[1] else []
         except (json.JSONDecodeError, TypeError):
             members = []
-        events.append({"id": r[0], "member_ids": members, "start_time": r[2], "end_time": r[3]})
+        events.append({"id": r[0], "member_ids": members, "start_time": r[2], "end_time": r[3], "time_basis": r[4]})
 
     intent = str(time_intent or "none").lower()
     if intent not in VALID_TIME_INTENTS:
@@ -464,6 +496,8 @@ def select_episodes(concept_id: str, time_intent: str = "none",
         now = time.time()
         # 事件时间是虚拟秒，需换算成真实时间再与窗口比较
         for e in events:
+            if e.get("time_basis") != "unix_utc":
+                continue
             real_end = _to_real(e["end_time"])
             age = now - real_end
             if lo <= age <= hi:
@@ -491,7 +525,7 @@ def fetch_members(episodes: list, max_members: int = MAX_RETURN_MEMBERS) -> list
 
     段内按时间倒序（新→旧），段间也按时间倒序。全程不做相似度排序。
     """
-    from .memory_engine import memories, _load_memory_from_db
+    from .memory_engine import memories, _load_memory_from_db, _is_visible
 
     out = []
     for e in episodes:
@@ -499,9 +533,10 @@ def fetch_members(episodes: list, max_members: int = MAX_RETURN_MEMBERS) -> list
         # 段内新→旧
         for mid in reversed(members):
             mem = memories.get(mid) or _load_memory_from_db(mid)
-            if not mem:
+            if not mem or not _is_visible(mem):
                 continue
-            out.append((mem, _to_real(mem.get("creation_time", 0))))
+            ts = _to_real(mem.get("creation_time", 0)) if mem.get("time_basis") == "unix_utc" else None
+            out.append((mem, ts))
             if len(out) >= max_members:
                 return out
     return out
@@ -531,3 +566,25 @@ def reload_from_db():
     with _lock:
         _init_concept_faiss()
         _rebuild_concept_faiss()
+
+
+def remove_members(ids):
+    """Remove stale concept references after physical memory deletion."""
+    dead = set(ids)
+    db = _get_db()
+    for eid, cid, raw in db.execute('SELECT id,concept_id,member_ids FROM concept_events').fetchall():
+        members = [mid for mid in json.loads(raw or '[]') if mid not in dead]
+        if members:
+            db.execute('UPDATE concept_events SET member_ids=? WHERE id=?', (json.dumps(members), eid))
+        else:
+            db.execute('DELETE FROM concept_events WHERE id=?', (eid,))
+    for (cid,) in db.execute('SELECT id FROM concepts').fetchall():
+        events = db.execute('SELECT id,member_ids FROM concept_events WHERE concept_id=?',(cid,)).fetchall()
+        if events:
+            count = sum(len(json.loads(row[1])) for row in events)
+            db.execute('UPDATE concepts SET event_ids=?,member_count=? WHERE id=?',
+                       (json.dumps([r[0] for r in events]),count,cid))
+        else:
+            db.execute('DELETE FROM concepts WHERE id=?',(cid,))
+    db.commit()
+    _rebuild_concept_faiss()

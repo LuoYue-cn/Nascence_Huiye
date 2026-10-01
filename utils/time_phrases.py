@@ -1,9 +1,10 @@
 import datetime
+from core.virtual_clock import clock
 
 def get_relative_time_phrase(real_timestamp: float) -> str:
     """根据记忆的真实Unix时间戳，返回相对时间短语"""
-    now = datetime.datetime.now()
-    dt = datetime.datetime.fromtimestamp(real_timestamp)
+    now = clock.local_datetime()
+    dt = clock.local_datetime(real_timestamp)
     delta = (now - dt).total_seconds()
 
     if delta < 60:

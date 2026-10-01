@@ -16,8 +16,9 @@ import os
 import subprocess
 import sys
 
-DATA_FILE = "data/test/metrics_daily.jsonl"
-DEFAULT_OUTPUT = "data/test/metrics_daily.xlsx"
+from utils.paths import data_path
+DATA_FILE = data_path("metrics_daily.jsonl")
+DEFAULT_OUTPUT = data_path("metrics_daily.xlsx")
 
 # 字段 -> 中文标题（顺序即工作表列顺序，A=日期，其后为各字段）
 FIELD_TITLES = [

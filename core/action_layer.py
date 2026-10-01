@@ -2,7 +2,7 @@
 # ========================================================================
 # 动作抉择层：每轮认知循环结束后的"本能冲动"。
 #
-# 位置：core/cognition.py 的 cognitive_loop 在发言决策之后调用，作为该轮的最后一步。
+# 位置：core/cognition.py 的 QQConversationService 在发言决策之后调用，作为该轮的最后一步。
 # 语义：本轮必须等抉择返回才继续（阻塞该轮），但实现上走线程池执行，
 #       以免堵住 asyncio 事件循环导致 NapCat 收消息与生物钟 tick 停摆。
 #
@@ -168,7 +168,7 @@ def _notes_brief(notes: list, max_chars: int = 600) -> str:
 
 
 def _user_prompt(thought_text: str, should_speak: bool, said_text: str,
-                 keywords: list, context_hint: str) -> str:
+                 keywords: list, context_hint: str, images=None, stickers=None) -> str:
     parts = []
     if context_hint:
         parts.append(f"【此刻的情况】{context_hint}")
@@ -186,8 +186,8 @@ def _user_prompt(thought_text: str, should_speak: bool, said_text: str,
         if kws:
             parts.append(f"【此刻萦绕的词】{kws}")
 
-    images = ASSETS.ordered_pool(ASSETS.IMAGE, keywords)
-    stickers = ASSETS.ordered_pool(ASSETS.STICKER, keywords)
+    images = ASSETS.ordered_pool(ASSETS.IMAGE, keywords) if images is None else images
+    stickers = ASSETS.ordered_pool(ASSETS.STICKER, keywords) if stickers is None else stickers
     if images:
         parts.append(_page_text(ASSETS.IMAGE, images, 0))
     if stickers:
@@ -232,7 +232,7 @@ def decide_action(thought_text: str, should_speak: bool, said_text: str = "",
     page_size = _page_size()
     images = ASSETS.ordered_pool(ASSETS.IMAGE, keywords)
     stickers = ASSETS.ordered_pool(ASSETS.STICKER, keywords)
-    pages = {ASSETS.IMAGE: 1, ASSETS.STICKER: 1}
+    pages = {ASSETS.IMAGE: 0, ASSETS.STICKER: 0}
     counts = {ASSETS.IMAGE: len(images), ASSETS.STICKER: len(stickers)}
     pending = ASSETS.list_pending()
     # 记事本允许从零开始写，所以"全空"不算无事可做；
@@ -242,7 +242,7 @@ def decide_action(thought_text: str, should_speak: bool, said_text: str = "",
 
     messages = [
         {"role": "system", "content": _system_prompt()},
-        {"role": "user", "content": _user_prompt(thought_text, should_speak, said_text, keywords, context_hint)},
+        {"role": "user", "content": _user_prompt(thought_text, should_speak, said_text, keywords, context_hint, images, stickers)},
     ]
 
     for turn in range(max_pages + 1):
@@ -253,15 +253,16 @@ def decide_action(thought_text: str, should_speak: bool, said_text: str = "",
 
         if action in ("image_next_page", "sticker_next_page"):
             kind = ASSETS.IMAGE if action.startswith("image") else ASSETS.STICKER
-            pages[kind] += 1
+            next_page = pages[kind] + 1
             total_pages = max(1, (counts[kind] + page_size - 1) // page_size)
-            if pages[kind] >= total_pages or turn >= max_pages - 1:
+            if next_page >= total_pages or turn >= max_pages:
                 # 已到末页或翻页次数用尽：把结论直接告知，不再继续翻
                 messages.append({"role": "assistant", "content": json.dumps(data, ensure_ascii=False)})
                 messages.append({"role": "user", "content": "已经翻到最后一页了，请现在做决定，不要再翻页。"})
                 continue
+            pages[kind] = next_page
             messages.append({"role": "assistant", "content": json.dumps(data, ensure_ascii=False)})
-            messages.append({"role": "user", "content": _page_text(kind, images if kind == ASSETS.IMAGE else stickers, pages[kind] - 1) + "\n\n请继续决定动作。"})
+            messages.append({"role": "user", "content": _page_text(kind, images if kind == ASSETS.IMAGE else stickers, pages[kind]) + "\n\n请继续决定动作。"})
             continue
 
         if action in VALID_ACTIONS:
@@ -279,7 +280,7 @@ def decide_action(thought_text: str, should_speak: bool, said_text: str = "",
 
 
 def _execute(action: str, data: dict, images: list, stickers: list) -> dict:
-    """校验并执行动作。发送类由调用方注入的发送函数完成（见 cognitive_loop）。"""
+    """校验并执行动作。发送类由调用方注入的发送函数完成（见 QQConversationService）。"""
     if action == "none":
         return {"action": "none", "detail": ""}
 

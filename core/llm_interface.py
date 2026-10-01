@@ -9,21 +9,25 @@ import subprocess
 import tempfile
 #import requests    # 使用网络访问链接LLM（已弃用）
 from openai import OpenAI
+from core.virtual_clock import clock
 import datetime
 from utils.monitor import append_log
 from utils.dialogue_state import get_state, set_state
 
 from config.api_config import config
 from config.constants import BOT_NAME
+from utils.session_context import model_timeout
 
 client = OpenAI(
     api_key=config["primary_api_key"],
     base_url=config["primary_base_url"],
+    timeout=float(config.get("model_timeout_seconds",45)), max_retries=0,
 )
 
 client_ = OpenAI(
     api_key=config["secondary_api_key"],
     base_url=config["secondary_base_url"],
+    timeout=float(config.get("model_timeout_seconds",45)), max_retries=0,
 )
 
 MODEL = config["primary_model"]
@@ -57,7 +61,7 @@ def get_history_context() -> str:
     append_log(result)
     return result
 
-def call_api_thinking(messages, max_tokens=8000, thinking=True, timeout=60.0):
+def call_api_thinking(messages, max_tokens=8000, thinking=True, timeout=None):
     """
     LLM思考模式唯一外部调用接口。
 
@@ -71,7 +75,7 @@ def call_api_thinking(messages, max_tokens=8000, thinking=True, timeout=60.0):
         "max_tokens": max_tokens,
         "temperature": 0.1,
         "stream": False,
-        "timeout": timeout,
+        "timeout": model_timeout(timeout),
     }
     if thinking:
         kwargs["reasoning_effort"] = "high"
@@ -100,7 +104,7 @@ def decompose_input(user_input: str) -> tuple:
         "topic": state.get("最近话题", "")
     }
     state_str = json.dumps(normalized_state, ensure_ascii=False)
-    now = datetime.datetime.now()
+    now = clock.local_datetime()
 
     system_prompt = f"""你是{BOT_NAME}，请理解输入的话，将其转换为“我”的第一人称记忆片段，并提取检索关键词。
 拆解规则：
@@ -144,6 +148,7 @@ def decompose_input(user_input: str) -> tuple:
             max_tokens=8000,
             temperature=0.1,
             stream=False,
+            timeout=model_timeout(),
             response_format={"type": "json_object"},
             extra_body={"thinking": {"type": "disabled"}},
         )
@@ -159,7 +164,7 @@ def decompose_input(user_input: str) -> tuple:
     if not result:  # 判空
         append_log("*"*30+"警告"+"*"*30)
         append_log("返回为空")
-        return [f"对方说：{user_input}"], "普通", None, None, "", "none"
+        raise ValueError("Understanding model returned no valid output")
 
     # 尝试解析 JSON
     try:
@@ -167,14 +172,24 @@ def decompose_input(user_input: str) -> tuple:
         if cleaned.startswith("```"):
             cleaned = cleaned.removeprefix("```").removeprefix("json").removesuffix("```").strip()
         data = json.loads(cleaned)
-    except json.JSONDecodeError:
-        append_log("*"*30+"警告"+"*"*30)
-        append_log("JSON解析失败，降级处理")
-        append_log(f"内容：{result}")
-        fallback = user_input.replace("我", "本系统由乐知网络技术部提出并完善严禁转载抄袭")
-        fallback = fallback.replace("你", "我")
-        fallback = fallback.replace("本系统由乐知网络技术部提出并完善严禁转载抄袭", "你")
-        return [f"你告诉我，{fallback}"], "普通", None, [], "", "none"
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise ValueError("Understanding model output is not valid JSON") from exc
+    if not isinstance(data, dict):
+        raise ValueError("Understanding model output must be an object")
+    for key in ("k", "mem"):
+        value = data.get(key, [])
+        if not isinstance(value, list) or len(value) > 32 or any(not isinstance(v, str) or len(v) > 20000 for v in value):
+            raise ValueError(f"Invalid understanding field: {key}")
+    if not isinstance(data.get("m", "normal"), str) or not isinstance(data.get("c", ""), str):
+        raise ValueError("Understanding mode and concept must be strings")
+    state_value = data.get("s")
+    if state_value is not None and (
+        not isinstance(state_value, dict)
+        or not isinstance(state_value.get("participants", []), list)
+        or any(not isinstance(v, str) for v in state_value.get("participants", []))
+        or not isinstance(state_value.get("topic", ""), str)
+    ):
+        raise ValueError("Invalid understanding state")
 
     # 提取字段
     keywords = data.get("k", [])
@@ -202,13 +217,6 @@ def decompose_input(user_input: str) -> tuple:
     mode_map = {"store": "存储", "ask": "询问", "normal": "普通"}
     mode = mode_map.get(mode_raw, "普通")
 
-    # 如果 memories 为空，则使用兜底逻辑
-    if not memories:
-        fallback = user_input.replace("我", "本系统由乐知网络技术部提出并完善严禁转载抄袭")
-        fallback = fallback.replace("你", "我")
-        fallback = fallback.replace("本系统由乐知网络技术部提出并完善严禁转载抄袭", "你")
-        memories = [f"你告诉我，{fallback}"]
-
     # 同步搜索输入内容（测试）
     if user_input not in keywords:
         keywords.append(user_input)
@@ -231,7 +239,8 @@ def _safe_json_parse(text: str) -> dict:
 
     # 优先标准 JSON 解析
     try:
-        return json.loads(cleaned)
+        parsed = json.loads(cleaned)
+        return parsed if isinstance(parsed, dict) else {}
     except json.JSONDecodeError:
         pass
 
@@ -349,7 +358,7 @@ def verbalize(memories: list, keywords: list = None, new_state: dict = None, use
     append_log("="*30+"LLM特供记忆"+"="*30)
     append_log(points)
 
-    now = datetime.datetime.now()
+    now = clock.local_datetime()
     state_hint = f"当前状态：{new_state}" if new_state else ""
     time_hint = f"现在时间为{str(now.time())[:2]}时{str(now.time())[3:5]}分"
 
@@ -390,13 +399,21 @@ def verbalize(memories: list, keywords: list = None, new_state: dict = None, use
     data = _safe_json_parse(reply)
     if "say" in data or "text" in data:
         return {
-            "say": bool(data.get("say", False)),
-            "text": str(data.get("text", "")),
+            "say": data.get("say") is True,
+            "text": data.get("text", "") if isinstance(data.get("text", ""), str) else "",
         }
 
     # 完全无法解析时降级
     append_log("*"*30+"JSON解析失败，降级处理"+"*"*30)
-    return {"say": True, "text": reply}
+    raise ValueError("Verbalization model output is not a valid decision")
+
+
+def _secondary_completion(snapshot,**kwargs):
+    # Each asynchronous media request owns its client, so changing settings
+    # cannot close a transport while the request is still using it.
+    with OpenAI(api_key=snapshot['secondary_api_key'],base_url=snapshot['secondary_base_url'],
+                timeout=model_timeout(snapshot['model_timeout_seconds']),max_retries=0) as provider:
+        return provider.chat.completions.create(**kwargs)
 
 
 async def describe_image_from_path(image_path: str, prompt: str = "请描述这张图片的内容，文字需全部复述，其他尽量简洁，禁止猜测或识别人物等信息，只要客观陈述") -> str:
@@ -426,7 +443,7 @@ async def describe_image_from_path(image_path: str, prompt: str = "请描述这�
         mime_type = mime_map.get(ext, 'image/jpeg')
         
         # 调用 API
-        response = client_.chat.completions.create(
+        response = await asyncio.to_thread(_secondary_completion, dict(config),
             model=MODEL_,
             messages=[
                 {
@@ -490,7 +507,7 @@ async def _describe_media_from_path(file_path: str, media_type: str, prompt: str
                 {"type": "video_url", "video_url": {"url": f"data:{mime_type};base64,{base64_str}"}},
             ]
 
-        response = client_.chat.completions.create(
+        response = await asyncio.to_thread(_secondary_completion, dict(config),
             model=MODEL_,
             messages=[{"role": "user", "content": content}],
             stream=False,
@@ -534,3 +551,14 @@ async def _convert_audio_to_wav(audio_path: str) -> str:
         except OSError:
             pass
         raise RuntimeError("语音格式转换失败，请确认 ffmpeg 已安装且支持 NapCat 音频格式")
+
+
+def refresh_clients():
+    """Called in the core executor after a validated configuration update."""
+    global client, client_, MODEL, MODEL_
+    client.close()
+    client_.close()
+    options = {"timeout": float(config.get("model_timeout_seconds", 45)), "max_retries": 0}
+    client = OpenAI(api_key=config["primary_api_key"], base_url=config["primary_base_url"], **options)
+    client_ = OpenAI(api_key=config["secondary_api_key"], base_url=config["secondary_base_url"], **options)
+    MODEL, MODEL_ = config["primary_model"], config["secondary_model"]

@@ -1,3 +1,4 @@
+from utils.paths import data_path
 # core/memory_engine.py
 import uuid
 #import heapq   # Dijkstra算法（已弃用）
@@ -12,6 +13,9 @@ import sqlite3
 import threading
 import random
 from collections import deque
+from contextlib import contextmanager
+from utils.session_context import current_group, model_timeout, current_source, current_message
+from utils.database import CoreConnection
 from .virtual_clock import clock
 from utils.monitor import append_log
 
@@ -21,7 +25,7 @@ _data_lock = threading.RLock()
 from config.api_config import config
 OLLAMA_BASE_URL = config["ollama_base_url"]
 OLLAMA_EMBED_MODEL = config["ollama_embed_model"]
-DB_FILE = "data/test/memory.db"     # 冷热数据交换保存地址
+DB_FILE = data_path("memory.db")     # 冷热数据交换保存地址
 SIMILARITY_THRESHOLD = 0.22         # 建立语义链接的最低相似度
 DEDUP_THRESHOLD = 0.92              # 余弦相似度超过此值视为重复
 DEFAULT_HALF_LIFE = 2 * 24 * 3600   # 默认记忆半衰值2天
@@ -34,7 +38,7 @@ RETRIEVAL_DEDUP_THRESHOLD = 0.75    # 检索结果去冗余弦相似度
 RETRIEVAL_MIN_EFFECTIVE = 0.02      # 有效相似度最低门槛
 WORDWEB_WINDOW_SIZE = 5             # 滑动窗口大小（以词为单位）
 WORDWEB_MIN_COOCCURRENCE = 2        # 最小共现次数，低于此值不参与后期扩散
-EMBED_DIM = 768                     # dmeta-embedding-zh 实测为 768 维
+EMBED_DIM = int(config.get("embedding_dimension", 768))                     # dmeta-embedding-zh 实测为 768 维
 MAX_OUT_EDGES = 5                   # 每个节点从 links 中保留的最强出边数
 MAX_QUEUE_SIZE = 2000               # 队列硬上限，防止爆炸
 MAX_HOT_SIZE = 1500                 # 热记忆节点硬上限，防止爆炸
@@ -57,7 +61,7 @@ _faiss_to_mem = []                  # faiss_id → memory_id
 _mem_to_faiss = {}                  # memory_id → faiss_id
 _db_conn = None                     # 全局数据库实例
 hot_ids = set()                     # 当前在内存中的记忆 ID
-_last_created_ids = []              # 存储本轮新增的记忆 ID（QQ接口：用于追踪本轮对话新创建的记忆（供 QQ bot 获取））
+_last_created_ids = deque(maxlen=200)              # 存储本轮新增的记忆 ID（QQ接口：用于追踪本轮对话新创建的记忆（供 QQ bot 获取））
 word_to_memories = {}               # {词: set(memory_id)}
 
 # ========== 链接增量同步标记 ==========
@@ -96,8 +100,8 @@ def _bump_link_deleted():
     _count_link_deleted += 1
 
 # 日志文件路径
-METRICS_LOG_FILE = "data/test/metrics_daily.jsonl"
-METRICS_BASELINE_FILE = "data/test/metrics_baseline.json"
+METRICS_LOG_FILE = data_path("metrics_daily.jsonl")
+METRICS_BASELINE_FILE = data_path("metrics_baseline.json")
 
 def _write_daily_metrics():
     """每日24点调用：计算今日增量，写入日志，更新基线"""
@@ -110,7 +114,7 @@ def _write_daily_metrics():
 
     # 计算今日增量
     increments = {
-        "date": time.strftime("%Y-%m-%d", time.localtime()),
+        "date": clock.local_datetime().date().isoformat(),
         "mem_created": _count_mem_created - baseline.get("mem_created", 0),
         "mem_deleted": _count_mem_deleted - baseline.get("mem_deleted", 0),
         "link_created": _count_link_created - baseline.get("link_created", 0),
@@ -213,10 +217,10 @@ def _get_db():
     global _db_conn
     if _db_conn is None:
         os.makedirs(os.path.dirname(DB_FILE), exist_ok=True)
-        _db_conn = sqlite3.connect(DB_FILE, check_same_thread=False)
+        _db_conn = sqlite3.connect(DB_FILE, check_same_thread=False, timeout=30, factory=CoreConnection)
         _db_conn.execute("PRAGMA journal_mode=WAL")  # 提高并发读性能
         # 记忆数据可容忍断电丢最后少量事务，换取明显更快的批量写入
-        _db_conn.execute("PRAGMA synchronous=NORMAL")
+        _db_conn.execute("PRAGMA synchronous=FULL")
         _db_conn.execute("""
             CREATE TABLE IF NOT EXISTS memories (
                 id TEXT PRIMARY KEY,
@@ -244,6 +248,20 @@ def _get_db():
         # idx_links_tgt 供"邻居查询"（src=? OR tgt=?）使用，保留。
         _db_conn.execute("DROP INDEX IF EXISTS idx_links_src")
         _db_conn.execute("CREATE INDEX IF NOT EXISTS idx_links_tgt ON links(tgt)")
+        columns = {r[1] for r in _db_conn.execute("PRAGMA table_info(memories)")}
+        for name, ddl in {
+            "scope": "TEXT NOT NULL DEFAULT 'legacy_unattributed'",
+            "group_id": "TEXT",
+            "source": "TEXT NOT NULL DEFAULT 'legacy'",
+            "source_message_id": "TEXT",
+            "time_basis": "TEXT NOT NULL DEFAULT 'legacy_unknown'",
+        }.items():
+            if name not in columns:
+                _db_conn.execute(f"ALTER TABLE memories ADD COLUMN {name} {ddl}")
+        if 'time_basis' not in {r[1] for r in _db_conn.execute('PRAGMA table_info(links)')}:
+            _db_conn.execute("ALTER TABLE links ADD COLUMN time_basis TEXT DEFAULT 'legacy_unknown'")
+        _db_conn.execute("CREATE TABLE IF NOT EXISTS core_metadata (key TEXT PRIMARY KEY, value TEXT)")
+        _db_conn.commit()
     return _db_conn
 
 def _load_memory_from_db(mem_id: str) -> dict:
@@ -252,17 +270,7 @@ def _load_memory_from_db(mem_id: str) -> dict:
     row = db.execute("SELECT * FROM memories WHERE id = ?", (mem_id,)).fetchone()
     if row is None:
         return None
-    # 构造 memory_dict
-    mem = {
-        "id": row[0],
-        "content": row[1],
-        "vector": np.frombuffer(row[2], dtype=np.float32).tolist(),
-        "half_life": row[3],
-        "last_accessed": row[4],
-        "creation_time": row[5],
-        "last_strengthen_time": row[6],
-        "concept_tag_ids": json.loads(row[7]) if row[7] else []
-    }
+    mem = _row_to_memory(row)
     memories[mem_id] = mem
     hot_ids.add(mem_id)
     _load_links_for_memory(mem_id)
@@ -280,16 +288,7 @@ def _batch_load_memories(mem_ids: list):
         mem_id = row[0]
         if mem_id in memories:
             continue
-        mem = {
-            "id": mem_id,
-            "content": row[1],
-            "vector": np.frombuffer(row[2], dtype=np.float32).tolist(),
-            "half_life": row[3],
-            "last_accessed": row[4],
-            "creation_time": row[5],
-            "last_strengthen_time": row[6],
-            "concept_tag_ids": json.loads(row[7]) if row[7] else []
-        }
+        mem = _row_to_memory(row)
         memories[mem_id] = mem
         hot_ids.add(mem_id)
     for mem_id in mem_ids:
@@ -338,7 +337,7 @@ def _load_link_from_db(src_id: str, tgt_id: str):
             return links[key]
         db = _get_db()
         row = db.execute(
-            "SELECT weight, type, last_accessed, creation_time FROM links WHERE src = ? AND tgt = ?",
+            "SELECT weight, type, last_accessed, creation_time, time_basis FROM links WHERE src = ? AND tgt = ?",
             (src_id, tgt_id)
         ).fetchone()
         if row is None:
@@ -347,7 +346,7 @@ def _load_link_from_db(src_id: str, tgt_id: str):
             "weight": row[0],
             "type": row[1],
             "last_accessed": row[2],
-            "creation_time": row[3],
+            "creation_time": row[3], "time_basis": row[4],
         }
         links[key] = link_data
         return link_data
@@ -357,18 +356,18 @@ def _load_links_for_memory(mem_id: str, limit: int = 200):
     with _data_lock:
         db = _get_db()
         rows = db.execute(
-            "SELECT src, tgt, weight, type, last_accessed, creation_time FROM links "
+            "SELECT src, tgt, weight, type, last_accessed, creation_time, time_basis FROM links "
             "WHERE src = ? OR tgt = ? LIMIT ?",
             (mem_id, mem_id, limit)
         ).fetchall()
-        for src, tgt, weight, ltype, last_accessed, creation_time in rows:
+        for src, tgt, weight, ltype, last_accessed, creation_time, time_basis in rows:
             key = (src, tgt)
             if key not in links:
                 links[key] = {
                     "weight": weight,
                     "type": ltype,
                     "last_accessed": last_accessed,
-                    "creation_time": creation_time,
+                    "creation_time": creation_time, "time_basis": time_basis,
                 }
 
 def _evict_cold_links(max_hot=MAX_HOT_LINKS):
@@ -387,11 +386,11 @@ def _evict_cold_links(max_hot=MAX_HOT_LINKS):
         for (src, tgt) in to_evict:
             d = links[(src, tgt)]
             db.execute(
-                """INSERT OR REPLACE INTO links (src, tgt, weight, type, last_accessed, creation_time)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
+                """INSERT OR REPLACE INTO links (src, tgt, weight, type, last_accessed, creation_time, time_basis)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
                 (src, tgt, d["weight"], d["type"],
                  d.get("last_accessed", d.get("creation_time", 0)),
-                 d.get("creation_time", 0))
+                 d.get("creation_time", 0), d.get("time_basis","legacy_unknown"))
             )
             del links[(src, tgt)]
             # 已直接写入 SQLite，无需再算作待同步的脏数据
@@ -436,8 +435,8 @@ def _sync_all_links_to_sqlite(full: bool = False):
 
         if full:
             existing = {}
-            rows = db.execute("SELECT src, tgt, weight, type, last_accessed, creation_time FROM links").fetchall()
-            for src, tgt, weight, ltype, last_accessed, creation_time in rows:
+            rows = db.execute("SELECT src, tgt, weight, type, last_accessed, creation_time, time_basis FROM links").fetchall()
+            for src, tgt, weight, ltype, last_accessed, creation_time, time_basis in rows:
                 key = (src, tgt)
                 if key in links:
                     continue  # 以内存热链接为准
@@ -445,19 +444,19 @@ def _sync_all_links_to_sqlite(full: bool = False):
                     "weight": weight,
                     "type": ltype,
                     "last_accessed": last_accessed,
-                    "creation_time": creation_time,
+                    "creation_time": creation_time, "time_basis": time_basis,
                 }
             merged = dict(existing)
             for key, d in links.items():
                 merged[key] = d
             db.execute("DELETE FROM links")
             db.executemany(
-                """INSERT OR REPLACE INTO links (src, tgt, weight, type, last_accessed, creation_time)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
+                """INSERT OR REPLACE INTO links (src, tgt, weight, type, last_accessed, creation_time, time_basis)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
                 [
                     (src, tgt, d["weight"], d["type"],
                      d.get("last_accessed", d.get("creation_time", 0)),
-                     d.get("creation_time", 0))
+                     d.get("creation_time", 0), d.get("time_basis","legacy_unknown"))
                     for (src, tgt), d in merged.items()
                 ]
             )
@@ -482,11 +481,11 @@ def _sync_all_links_to_sqlite(full: bool = False):
                 src, tgt = key
                 params.append((src, tgt, d["weight"], d["type"],
                                d.get("last_accessed", d.get("creation_time", 0)),
-                               d.get("creation_time", 0)))
+                               d.get("creation_time", 0), d.get("time_basis","legacy_unknown")))
             if params:
                 db.executemany(
-                    """INSERT OR REPLACE INTO links (src, tgt, weight, type, last_accessed, creation_time)
-                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    """INSERT OR REPLACE INTO links (src, tgt, weight, type, last_accessed, creation_time, time_basis)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
                     params
                 )
                 written = len(params)
@@ -496,54 +495,101 @@ def _sync_all_links_to_sqlite(full: bool = False):
         return written
 
 def _build_word_to_memories():
-    """从所有记忆的 content 重建词→记忆ID的倒排索引"""
-    global word_to_memories
+    """Rebuild from the entire authoritative DB, including cold memories."""
     word_to_memories.clear()
-    for mem_id, mem in memories.items():
-        words = set(jieba.cut(mem["content"]))
-        for word in words:
-            if word not in word_to_memories:
-                word_to_memories[word] = set()
-            word_to_memories[word].add(mem_id)
-    print(f"[词网] 倒排索引重建完成，共 {len(word_to_memories)} 个词")
+    for mem_id, content in _get_db().execute("SELECT id, content FROM memories"):
+        for word in set(jieba.cut(content)):
+            word_to_memories.setdefault(word, set()).add(mem_id)
+
+
+def validate_vector(vector):
+    arr = np.asarray(vector, dtype=np.float32)
+    if arr.ndim != 1 or arr.size != EMBED_DIM or not np.isfinite(arr).all():
+        raise ValueError(f"Invalid embedding: expected {EMBED_DIM} finite dimensions")
+    if float(np.linalg.norm(arr)) <= 0:
+        raise ValueError("Embedding cannot be a zero vector")
+    return arr
+
+
+def _is_visible(mem):
+    group = current_group.get()
+    return group is None or mem.get("scope") == "persona_shared" or (
+        mem.get("scope") == "group" and str(mem.get("group_id")) == group
+    )
+
+
+def _row_to_memory(row):
+    result = {
+        "id": row[0], "content": row[1],
+        "vector": np.frombuffer(row[2], dtype=np.float32).tolist(),
+        "half_life": row[3], "last_accessed": row[4],
+        "creation_time": row[5], "last_strengthen_time": row[6],
+        "concept_tag_ids": json.loads(row[7] or "[]"),
+    }
+    for i, key in enumerate(("scope", "group_id", "source", "source_message_id", "time_basis"), 8):
+        result[key] = row[i] if len(row) > i else None
+    return result
+
+
+def _search_visible(vector, k):
+    """Restrict the candidate set BEFORE ranking, including graph neighbors."""
+    ids, vectors = [], []
+    for row in _get_db().execute("SELECT * FROM memories"):
+        mem = _row_to_memory(row)
+        if _is_visible(mem):
+            ids.append(mem["id"])
+            vectors.append(validate_vector(mem["vector"]))
+    if not ids:
+        return []
+    index = faiss.IndexFlatIP(EMBED_DIM)
+    matrix = np.stack(vectors)
+    faiss.normalize_L2(matrix)
+    index.add(matrix)
+    scores, positions = index.search(vector, min(k, len(ids)))
+    return [(float(score), ids[pos]) for score, pos in zip(scores[0], positions[0]) if pos >= 0]
+
+
+@contextmanager
+def atomic_memories():
+    """One DB commit for memory, links, concepts and the job checkpoint.
+
+    Embeddings must be prepared before entering. Rollback rebuilds all caches.
+    """
+    with _data_lock:
+        db = _get_db()
+        if db.atomic_depth:
+            yield db
+            return
+        counters = _export_metrics_counters()
+        original_words = dict(wordweb)
+        db.execute("BEGIN IMMEDIATE")
+        db.atomic_depth = 1
+        try:
+            yield db
+            _sync_all_links_to_sqlite()
+            db.execute('INSERT OR REPLACE INTO core_metadata VALUES(?,?)',('metrics',json.dumps(_export_metrics_counters())))
+            db.execute('INSERT OR REPLACE INTO core_metadata VALUES(?,?)',('wordweb',json.dumps({f'{a}||{b}':v for (a,b),v in wordweb.items()},ensure_ascii=False)))
+            db.atomic_depth = 0
+            db.commit()
+        except BaseException:
+            db.atomic_depth = 0
+            db.rollback()
+            memories.clear()
+            hot_ids.clear()
+            links.clear()
+            _dirty_links.clear()
+            _deleted_links.clear()
+            _rebuild_faiss_index()
+            _build_word_to_memories()
+            wordweb.clear(); wordweb.update(original_words)
+            _import_metrics_counters(counters)
+            from core import concept_store
+            concept_store._init_concept_faiss()
+            concept_store._rebuild_concept_faiss()
+            raise
 
 
 # ========== 模型加载 ==========
-def _ensure_embedding_model():
-    """确保 embedding 模型已拉取；缺失则通过 Ollama API 自动拉取。"""
-    import requests
-    base_name = OLLAMA_EMBED_MODEL.split(":")[0]
-    try:
-        tags = requests.get(f"{OLLAMA_BASE_URL}/api/tags", timeout=10).json()
-        models = [m.get("name", "") for m in tags.get("models", [])]
-        if any(m == OLLAMA_EMBED_MODEL or m.startswith(base_name) for m in models):
-            return
-    except Exception:
-        # 列表请求失败（Ollama 未就绪等）则跳过自动拉取，交给后续错误提示
-        return
-
-    print(f"[Ollama] 未检测到模型 {OLLAMA_EMBED_MODEL}，正在自动拉取（约400MB，首次可能较慢）...")
-    try:
-        resp = requests.post(
-            f"{OLLAMA_BASE_URL}/api/pull",
-            json={"model": OLLAMA_EMBED_MODEL},
-            timeout=1800,
-        )
-        resp.raise_for_status()
-        print("[Ollama] 模型拉取完成")
-    except Exception as e:
-        print(f"[Ollama] 模型拉取失败: {e}")
-
-
-def get_model():
-    print("正在启动语义模型")
-    try:
-        _ensure_embedding_model()
-        text_to_vector("启动")
-    except Exception as e:
-        print(f"[Ollama] 模型预热失败: {e}")
-    print("语义模型启动完成！")
-
 def text_to_vector(text: str) -> list:
     """
     使用 Ollama 的 API 将文本转换为向量。
@@ -555,14 +601,14 @@ def text_to_vector(text: str) -> list:
     url_old = f"{OLLAMA_BASE_URL}/api/embeddings"
     try:
         # 新版端点 /api/embed
-        resp = requests.post(url_new, json={"model": OLLAMA_EMBED_MODEL, "input": text}, timeout=30)
+        resp = requests.post(url_new, json={"model": OLLAMA_EMBED_MODEL, "input": text}, timeout=model_timeout())
         if resp.status_code == 200:
             data = resp.json()
             embeddings = data.get("embeddings")
             if embeddings:
                 return embeddings[0]
         # 旧版端点 /api/embeddings（新版不可用时回退）
-        resp = requests.post(url_old, json={"model": OLLAMA_EMBED_MODEL, "prompt": text}, timeout=30)
+        resp = requests.post(url_old, json={"model": OLLAMA_EMBED_MODEL, "prompt": text}, timeout=model_timeout())
         resp.raise_for_status()
         data = resp.json()
         embedding = data.get("embedding")
@@ -606,17 +652,19 @@ def _grow_wordweb(content: str, mem_id: str):
             distance = j - i
             now = clock.now()
             if key in wordweb:
-                entry = wordweb[key]
+                entry = dict(wordweb[key])
+                wordweb[key] = entry
                 # 增量更新平均距离
                 total = entry["forward_count"] * entry["avg_distance"]
                 entry["forward_count"] += 1
                 entry["avg_distance"] = (total + distance) / entry["forward_count"]
                 entry["last_updated"] = now
+                entry["time_basis"] = "unix_utc"
             else:
                 wordweb[key] = {
                     "forward_count": 1,
                     "avg_distance": float(distance),
-                    "last_updated": now
+                    "last_updated": now, "time_basis": "unix_utc"
                 }
                 global _count_wordweb_created
                 _count_wordweb_created += 1
@@ -642,7 +690,7 @@ def _rebuild_faiss_index():
         db = _get_db()
         rows = db.execute("SELECT id, vector FROM memories").fetchall()
         for mem_id, vec_blob in rows:
-            vec = np.frombuffer(vec_blob, dtype=np.float32).reshape(1, -1)
+            vec = validate_vector(np.frombuffer(vec_blob, dtype=np.float32)).reshape(1, -1)
             faiss.normalize_L2(vec)
             _faiss_index.add(vec)
             faiss_id = _faiss_index.ntotal - 1
@@ -665,17 +713,19 @@ def add_link(src_id: str, tgt_id: str, weight: float, link_type: str):
             links[key]["type"] = link_type
             links[key]["last_accessed"] = now
         else:
-            links[key] = {"weight": weight, "type": link_type, "last_accessed": now, "creation_time": now}
+            links[key] = {"weight": weight, "type": link_type, "last_accessed": now, "creation_time": now, "time_basis": "unix_utc"}
             global _count_link_created
             _count_link_created += 1
         _dirty_links.add(key)
         _deleted_links.discard(key)
+        _sync_all_links_to_sqlite()
 
 def decay_link(src_id: str, tgt_id: str) -> float:
     key = (src_id, tgt_id)
     with _data_lock:
         if key not in links:
             return 0.0
+        if links[key].get("time_basis") != "unix_utc": return links[key]["weight"]
         now = clock.now()
         delta = now - links[key].get("last_accessed", links[key].get("creation_time", now))
         decay = time_decay(delta, LINK_HALF_LIFE)
@@ -701,50 +751,49 @@ def build_initial_links(new_mem_id: str):
     k = min(10, _faiss_index.ntotal)
     if k == 0:
         return
-    scores, faiss_ids = _faiss_index.search(new_vec, k)
-
-    for score, faiss_id in zip(scores[0], faiss_ids[0]):
-        if faiss_id == -1:
-            continue
-        other_id = _faiss_to_mem[faiss_id]
-        if other_id == new_mem_id:
-            continue
-        sim = float(score)  # 内积 = 余弦相似度
-        if sim >= SIMILARITY_THRESHOLD:
-            add_link(new_mem_id, other_id, sim, "semantic")
-            add_link(other_id, new_mem_id, sim, "semantic")
+    for score, other_id in _search_visible(new_vec, k):
+        if other_id != new_mem_id and score >= SIMILARITY_THRESHOLD:
+            add_link(new_mem_id, other_id, score, "semantic")
+            add_link(other_id, new_mem_id, score, "semantic")
 
 def get_random_memory_id() -> str | None:
     """在锁保护下安全随机选取一个记忆 ID，避免并发迭代或下沉删除引发异常。
     依次检查：hot_ids -> memories -> SQLite 数据库兜底。
     """
     with _data_lock:
-        if hot_ids:
-            return random.choice(tuple(hot_ids))
-        if memories:
-            return random.choice(tuple(memories.keys()))
-        try:
-            db = _get_db()
-            row = db.execute("SELECT id FROM memories ORDER BY RANDOM() LIMIT 1").fetchone()
-            if row:
-                return row[0]
-        except Exception:
-            pass
-        return None
+        candidates = [_row_to_memory(row) for row in _get_db().execute("SELECT * FROM memories")]
+        ids = [m["id"] for m in candidates if _is_visible(m)]
+        return random.choice(ids) if ids else None
 
 def get_memory_content(mem_id: str) -> str | None:
     """在锁保护下安全获取记忆文本。如果已不在内存则从数据库兜底读取。"""
     with _data_lock:
         mem = memories.get(mem_id)
         if mem:
-            return mem.get("content")
+            return mem.get("content") if _is_visible(mem) else None
         loaded = _load_memory_from_db(mem_id)
         if loaded:
-            return loaded.get("content")
+            return loaded.get("content") if _is_visible(loaded) else None
         return None
 
-def create_memory(content: str, half_life: float = DEFAULT_HALF_LIFE) -> str:
-    vec = text_to_vector(content)
+def create_memory(content: str, half_life: float = DEFAULT_HALF_LIFE, *, vector=None,
+                  scope=None, group_id=None, source=None, source_message_id=None) -> str:
+    if not isinstance(content, str) or not content.strip() or len(content) > 20000:
+        raise ValueError("Memory content must be a nonempty string, at most 20000 characters")
+    if not np.isfinite(half_life) or half_life <= 0:
+        raise ValueError("Memory half life must be positive and finite")
+    vec = validate_vector(text_to_vector(content) if vector is None else vector).tolist()
+    group_id = str(group_id) if group_id is not None else current_group.get()
+    scope = scope or ("group" if group_id is not None else "persona_shared")
+    if scope not in {"group", "persona_shared", "legacy_unattributed"} or (scope == "group" and (not group_id or not group_id.isdigit() or len(group_id)>20)):
+        raise ValueError("Invalid memory scope")
+    if scope=="persona_shared": group_id=None
+    source = source or current_source.get()
+    source_message_id = source_message_id or current_message.get()
+    if not _get_db().atomic_depth:
+        with atomic_memories():
+            return create_memory(content,half_life,vector=vec,scope=scope,group_id=group_id,
+                                 source=source,source_message_id=source_message_id)
     mem_id = generate_memory_id()
     now = clock.now()
     memory_dict = {
@@ -755,17 +804,18 @@ def create_memory(content: str, half_life: float = DEFAULT_HALF_LIFE) -> str:
         "last_accessed": now,
         "creation_time": now,
         "last_strengthen_time": now,
-        "concept_tag_ids": []
+        "concept_tag_ids": [], "scope": scope, "group_id": group_id,
+        "source": source, "source_message_id": source_message_id, "time_basis": "unix_utc",
     }
 
     with _data_lock:
         db = _get_db()
         db.execute(
             """INSERT INTO memories (id, content, vector, half_life, last_accessed,
-               creation_time, last_strengthen_time, concept_tag_ids)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+               creation_time, last_strengthen_time, concept_tag_ids, scope, group_id, source, source_message_id, time_basis)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (mem_id, content, np.array(vec, dtype=np.float32).tobytes(),
-             half_life, now, now, now, json.dumps([]))
+             half_life, now, now, now, json.dumps([]), scope, group_id, source, source_message_id, "unix_utc")
         )
         db.commit()
 
@@ -790,7 +840,7 @@ def create_memory(content: str, half_life: float = DEFAULT_HALF_LIFE) -> str:
 def access_memory(mem_id: str):
     with _data_lock:
         mem = memories.get(mem_id)
-        if not mem:
+        if not mem or not _is_visible(mem):
             return
         now = clock.now()
         mem["last_accessed"] = now
@@ -801,6 +851,10 @@ def access_memory(mem_id: str):
         strengthen_amount = STRENGTHEN_BASE * discount
         mem["half_life"] += strengthen_amount
         mem["last_strengthen_time"] = now
+        db = _get_db()
+        db.execute("UPDATE memories SET last_accessed=?, half_life=?, last_strengthen_time=? WHERE id=?",
+                   (now, mem["half_life"], now, mem_id))
+        db.commit()
 
 def time_decay(delta_t: float, half_life: float) -> float:
     if half_life <= 0:
@@ -811,6 +865,7 @@ def check_and_handle_expired(mem_id: str) -> bool:
     mem = memories.get(mem_id)
     if not mem:
         return False
+    if mem.get("time_basis") != "unix_utc": return True
     now = clock.now()
     delta = now - mem["last_accessed"]
     decay = 2 ** (-delta / mem["half_life"])
@@ -822,23 +877,19 @@ def check_and_handle_expired(mem_id: str) -> bool:
 
 def retrieve_similar(query_text: str, k: int = K_RETRIEVAL) -> list:
     append_log(f"=====搜索关键词：{query_text}=====")
-    q_vec = np.array(text_to_vector(query_text), dtype=np.float32).reshape(1, -1)
+    q_vec = validate_vector(text_to_vector(query_text)).reshape(1, -1)
     faiss.normalize_L2(q_vec)
 
     # 粗筛：faiss 快速召回 k * 3 个候选
     search_k = k * 5
-    scores, faiss_ids = _faiss_index.search(q_vec, search_k)
+    candidates = _search_visible(q_vec, search_k)
 
     # 精确筛选：时间衰减 + 去冗余
     now = clock.now()
     results = []
     seen_ids = set()
 
-    for score, faiss_id in zip(scores[0], faiss_ids[0]):
-        if faiss_id == -1:            # faiss 返回 -1 表示无效结果
-            continue
-        mem_id = _faiss_to_mem[faiss_id]
-
+    for score, mem_id in candidates:
         mem = memories.get(mem_id)
         if not mem:
             mem = _load_memory_from_db(mem_id)
@@ -849,10 +900,10 @@ def retrieve_similar(query_text: str, k: int = K_RETRIEVAL) -> list:
 
         delta = now - mem["last_accessed"]
         decay = 2 ** (-delta / mem["half_life"])
-        decay = min(decay, 0.95)
+        decay = min(decay, 0.95) if mem.get("time_basis") == "unix_utc" else 0.95
         # 时间新鲜度：新记忆天然占优，随时间逐渐失去优势
         time_since_creation = now - mem["creation_time"]
-        freshness = 1.0 / (1.0 + time_since_creation / DEFAULT_HALF_LIFE)
+        freshness = 1.0 / (1.0 + max(0, time_since_creation) / DEFAULT_HALF_LIFE) if mem.get("time_basis") == "unix_utc" else 1.0
         effective = score * decay * freshness       # score 是余弦相似度（内积，因为向量已归一化）
 
         if effective < RETRIEVAL_MIN_EFFECTIVE:
@@ -890,26 +941,14 @@ def retrieve_by_exact_keywords(keywords: list, k: int = 5) -> list:
     返回: [(score, memory_dict), ...]
     """
     matched_ids = set()
-    MAX_IDS_PER_KEYWORD = 50   # 每个关键词最多取 50 个记忆ID
     for kw in keywords:
-        if kw in word_to_memories:
-            ids = word_to_memories[kw]
-            if len(ids) > MAX_IDS_PER_KEYWORD:
-                # 如果太多，随机取一部分（或按最近访问时间排序，这里简单用 set 迭代截断）
-                ids = set(list(ids)[:MAX_IDS_PER_KEYWORD])
-            matched_ids.update(ids)
-    
-    # 限制总数
-    MAX_TOTAL_IDS = 100
-    if len(matched_ids) > MAX_TOTAL_IDS:
-        matched_ids = set(list(matched_ids)[:MAX_TOTAL_IDS])
-    
-    # 收集需要从 SQLite 加载的 ID
-    cold_ids = [mid for mid in matched_ids if mid not in memories]
-    if cold_ids:
-        # 批量加载冷记忆
-        _batch_load_memories(cold_ids)
-    
+        matched_ids.update(word_to_memories.get(kw, set()))
+    visible = []
+    for mid in matched_ids:
+        mem = memories.get(mid) or _load_memory_from_db(mid)
+        if mem and _is_visible(mem):
+            visible.append(mid)
+    matched_ids = visible
     results = []
     now = clock.now()
     for mem_id in matched_ids:
@@ -918,7 +957,7 @@ def retrieve_by_exact_keywords(keywords: list, k: int = 5) -> list:
             continue
         delta = now - mem["last_accessed"]
         decay = 2 ** (-delta / mem["half_life"])
-        decay = min(decay, 0.95)
+        decay = min(decay, 0.95) if mem.get("time_basis") == "unix_utc" else 0.95
         effective = 0.85 * decay
         if effective < RETRIEVAL_MIN_EFFECTIVE:
             continue
@@ -945,6 +984,10 @@ def pathfind_activation(seed_ids: list, max_stamina: float = 3.0, top_k: int = 8
         for (src, tgt), link_data in list(links.items()):
             if (src, tgt) in inhibited_edges:
                 continue
+            sm = memories.get(src) or _load_memory_from_db(src)
+            tm = memories.get(tgt) or _load_memory_from_db(tgt)
+            if not sm or not tm or not _is_visible(sm) or not _is_visible(tm):
+                continue
             if src not in adj:
                 adj[src] = []
             w = decay_link(src, tgt)
@@ -957,31 +1000,28 @@ def pathfind_activation(seed_ids: list, max_stamina: float = 3.0, top_k: int = 8
                 adj[src] = adj[src][:MAX_OUT_EDGES]
 
         for seed in seed_ids:
-            if seed not in memories:
+            seed_mem = memories.get(seed) or _load_memory_from_db(seed)
+            if not seed_mem or not _is_visible(seed_mem):
                 continue
             seed_vec = np.array(memories[seed]["vector"], dtype=np.float32).reshape(1, -1)
             faiss.normalize_L2(seed_vec)
             k_sem = min(5, _faiss_index.ntotal)
             if k_sem == 0:
                 continue
-            scores, faiss_ids = _faiss_index.search(seed_vec, k_sem + 1)
-            for score, fid in zip(scores[0], faiss_ids[0]):
-                if fid == -1:
+            for score, neighbor_id in _search_visible(seed_vec, k_sem + 1):
+                if neighbor_id == seed or score < SIMILARITY_THRESHOLD:
                     continue
-                neighbor_id = _faiss_to_mem[fid]
-                if neighbor_id == seed:
-                    continue
-                sim = float(score)
-                if sim < SIMILARITY_THRESHOLD:
-                    continue
-                adj.setdefault(seed, []).append((neighbor_id, sim, "semantic_fast"))
-                adj.setdefault(neighbor_id, []).append((seed, sim, "semantic_fast"))
+                if (seed, neighbor_id) not in inhibited_edges:
+                    adj.setdefault(seed, []).append((neighbor_id, score, "semantic_fast"))
+                if (neighbor_id, seed) not in inhibited_edges:
+                    adj.setdefault(neighbor_id, []).append((seed, score, "semantic_fast"))
 
         activation = {}
         visited_edges = set()
 
         for seed in seed_ids:
-            if seed not in memories:
+            seed_mem = memories.get(seed) or _load_memory_from_db(seed)
+            if not seed_mem or not _is_visible(seed_mem):
                 continue
             q = deque()
             q.append((seed, max_stamina, 0))
@@ -998,7 +1038,7 @@ def pathfind_activation(seed_ids: list, max_stamina: float = 3.0, top_k: int = 8
                         if loaded is None:
                             continue
                     edge_key = (cur, tgt)
-                    if edge_key in visited_edges:
+                    if edge_key in inhibited_edges or edge_key in visited_edges:
                         continue
                     visited_edges.add(edge_key)
                     if output_visited_edges is not None:
@@ -1037,6 +1077,7 @@ def semantic_dedup(content: str, time_tolerance: float = 1.0, now: float = None)
     best_id = None
     best_sim = 0.0
     for mem_id, mem in memories.items():
+        if not _is_visible(mem): continue
         sim = cosine_similarity(vec, mem["vector"])
         if sim < DEDUP_THRESHOLD:
             continue
@@ -1065,7 +1106,7 @@ def _purge_expired_memories(expiration_threshold=0.001):
     db = _get_db()
     now = clock.now()
     # 从 SQLite 中查询所有记忆的ID、last_accessed、half_life
-    rows = db.execute("SELECT id, last_accessed, half_life FROM memories").fetchall()
+    rows = db.execute("SELECT id, last_accessed, half_life FROM memories WHERE time_basis='unix_utc'").fetchall()
     expired_ids = []
     for mem_id, last_accessed, half_life in rows:
         delta = now - last_accessed
@@ -1106,5 +1147,8 @@ def _purge_expired_memories(expiration_threshold=0.001):
     global _count_mem_deleted
     _count_mem_deleted += len(expired_ids)
 
+    _build_word_to_memories()
+    from core.concept_store import remove_members
+    remove_members(expired_ids)
     # faiss 索引无法直接删除，稍后由调用者全量重建
     return expired_ids

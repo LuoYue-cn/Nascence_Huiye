@@ -1,0 +1,23 @@
+services:
+  huiye:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: nascence-huiye:latest
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      HUIYE_DATA_DIR: /data
+      HUIYE_CONFIG_DIR: /runtime-config
+      HUIYE_ADMIN_PASSWORD: ${HUIYE_ADMIN_PASSWORD:?Set HUIYE_ADMIN_PASSWORD in docker/.env}
+      HUIYE_NAPCAT_TOKEN: ${HUIYE_NAPCAT_TOKEN:?Set HUIYE_NAPCAT_TOKEN in docker/.env}
+    volumes:
+      - huiye-data:/data
+      - huiye-config:/runtime-config
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+volumes:
+  huiye-data:
+  huiye-config:

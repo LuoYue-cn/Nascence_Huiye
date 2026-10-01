@@ -1,3 +1,4 @@
+from utils.paths import data_path
 # core/asset_library.py
 # ========================================================================
 # 素材库：以持久化字典（描述 → 文件名）维护图片与表情包收藏。
@@ -23,10 +24,10 @@ IMAGE = "image"
 STICKER = "sticker"
 _KINDS = (IMAGE, STICKER)
 
-ASSET_ROOT = "data/test/assets"
+ASSET_ROOT = data_path("assets")
 INDEX_FILE = os.path.join(ASSET_ROOT, "index.json")
-STAGING_DIR = "data/test/media_staging"
-NOTE_DIR = "data/notes"
+STAGING_DIR = data_path("media_staging")
+NOTE_DIR = data_path("notes")
 
 MAX_ASSETS_PER_KIND = 300      # 单类收藏上限，超出按最久未使用淘汰
 MAX_FILE_BYTES = 8 * 1024 * 1024   # 单个素材体积上限
@@ -88,24 +89,8 @@ def _load() -> dict:
 
 
 def _save():
-    """原子落盘，避免读写竞争下产生半截文件。
-
-    Windows 上 os.replace 偶发因杀毒/索引服务的瞬态占用而失败（WinError 5/32），
-    这类占用转瞬即逝，短重试即可，不必让一次动作因为落盘抖动而失败。
-    """
-    with _lock:
-        os.makedirs(ASSET_ROOT, exist_ok=True)
-        tmp = INDEX_FILE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(_index, f, ensure_ascii=False, indent=2)
-        for attempt in range(5):
-            try:
-                os.replace(tmp, INDEX_FILE)
-                return
-            except PermissionError:
-                if attempt == 4:
-                    raise
-                time.sleep(0.05 * (attempt + 1))
+    from utils.paths import atomic_json
+    with _lock: atomic_json(INDEX_FILE,_index or _empty_index())
 
 
 def _asset_id(kind: str, desc: str) -> str:
@@ -520,6 +505,7 @@ def edit_note(name: str, old_text: str, new_text: str = "") -> dict | None:
         return None
 
     replacement = str(new_text or "").strip()
+    if len(replacement)>MAX_NOTE_CHARS: return None
     changed = 0
     kept = []
     for line in lines:
@@ -536,6 +522,7 @@ def edit_note(name: str, old_text: str, new_text: str = "") -> dict | None:
     if changed == 0:
         return None
 
+    if len("\n".join(kept).encode("utf-8"))>64*1024: return None
     if not _write_note_lines(path, kept):
         return None
     return {"path": path, "changed": changed, "kept": len(kept)}
@@ -558,20 +545,17 @@ def _normalize_note_line(text: str) -> str:
 def _write_note_lines(path: str, lines: list) -> bool:
     """原子重写整个文件（先写临时文件再替换），避免中途失败留下半截内容。"""
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + ".tmp"
+    import tempfile
+    fd,tmp=tempfile.mkstemp(prefix='note-',dir=os.path.dirname(path))
     try:
-        with open(tmp, "w", encoding="utf-8") as f:
-            for line in lines:
-                f.write(f"{line}\n")
-        os.replace(tmp, path)
+        with os.fdopen(fd,'w',encoding='utf-8') as f:
+            for line in lines: f.write(f'{line}\n')
+            f.flush();os.fsync(f.fileno())
+        os.replace(tmp,path)
         return True
-    except OSError:
-        try:
-            if os.path.exists(tmp):
-                os.remove(tmp)
-        except OSError:
-            pass
-        return False
+    except OSError: return False
+    finally:
+        if os.path.exists(tmp): os.unlink(tmp)
 
 
 def read_note(name: str, max_chars: int = MAX_NOTE_READ_CHARS) -> dict | None:
@@ -620,3 +604,26 @@ def note_exists(name: str) -> bool:
     if not base:
         return False
     return os.path.isfile(os.path.join(NOTE_DIR, f"{base}.txt"))
+
+# Only the single core executor enters these storage contexts. Group assets and
+# notes never become candidate inputs for another group's action decision.
+from contextlib import contextmanager
+_storage_states = {}
+
+@contextmanager
+def group_storage(group_id):
+    global ASSET_ROOT, INDEX_FILE, STAGING_DIR, NOTE_DIR, _index, _pending, _pending_seq
+    from utils.paths import DATA_DIR
+    group = str(group_id)
+    if not group.isdigit():
+        raise ValueError('Invalid QQ group storage ID')
+    previous = (ASSET_ROOT,INDEX_FILE,STAGING_DIR,NOTE_DIR,_index,_pending,_pending_seq)
+    root = DATA_DIR / 'groups' / group
+    ASSET_ROOT = str(root/'assets'); INDEX_FILE = str(root/'assets/index.json')
+    STAGING_DIR = str(root/'media_staging'); NOTE_DIR = str(root/'notes')
+    _index,_pending,_pending_seq = _storage_states.get(group,(None,{},0))
+    try:
+        yield
+    finally:
+        _storage_states[group] = (_index,_pending,_pending_seq)
+        ASSET_ROOT,INDEX_FILE,STAGING_DIR,NOTE_DIR,_index,_pending,_pending_seq = previous

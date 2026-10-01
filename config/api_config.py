@@ -1,5 +1,6 @@
 import json
 import os
+from utils.paths import CONFIG_DIR, atomic_json
 
 
 def normalize_proxy_environment():
@@ -24,7 +25,7 @@ def normalize_proxy_environment():
 
 normalize_proxy_environment()
 
-CONFIG_FILE = os.path.join(os.path.dirname(__file__), "api_config.json")
+CONFIG_FILE = str(CONFIG_DIR / "api_config.json")
 
 DEFAULT_CONFIG = {
     "primary_api_key": "YOUR_API_KEY_HERE",
@@ -37,7 +38,19 @@ DEFAULT_CONFIG = {
     "ollama_embed_model": "shaw/dmeta-embedding-zh",
     "bot_qq": "123456",
     "active_group_id": "123456",
-    "napcat_token": "Nascence",
+    "napcat_token": "",
+    "timezone": "Asia/Taipei",
+    "embedding_dimension": 768,
+    "active_enabled": False,
+    "active_interval_seconds": 60,
+    "max_queue_size": 100,
+    "reply_ttl_seconds": 300,
+    "model_timeout_seconds": 45,
+    "sleep_start_hour": None,
+    "sleep_end_hour": None,
+    "max_media_bytes": 8 * 1024 * 1024,
+    "max_media_count": 4,
+    "napcat_http_base_url": "http://127.0.0.1:5700",
     # ===== 生物钟参数（动力学速率，非钟点；不预设节律周期）=====
     "biorhythm_wake_seconds": 18.40 * 3600, # 清醒时睡眠压力上升的指数时间常数（秒）
     "biorhythm_sleep_seconds": 9.1 * 3600,  # 睡眠时睡眠压力回落的指数时间常数（秒）
@@ -72,7 +85,8 @@ def reload_config():
     return config
 
 def save_config(cfg):
-    with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, ensure_ascii=False, indent=2)
+    atomic_json(CONFIG_FILE, cfg)
+    config.clear()
+    config.update(cfg)
 
 config = load_config()

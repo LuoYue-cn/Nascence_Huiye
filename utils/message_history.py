@@ -1,105 +1,53 @@
-import os, json, threading
+"""SQLite history with unbounded durable sequence numbers and group context."""
+import json
+from config.constants import BOT_NAME
+from utils.session_context import current_group, current_message
+from utils.paths import data_path
+from app.repositories.sqlite import history_repository
 
-_message_history = []
-_max_history = 200
-_lock = threading.Lock()
-_flushed_count = 0
-_HISTORY_FILE = "data/test/message_history.log"
-_STATE_FILE = "data/test/message_state.json"
-
+_HISTORY_FILE = data_path('message_history.log')
+_STATE_FILE = data_path('message_state.json')
 
 def add_message(sender, content, source, quote=None):
-    """追加一条历史消息。
+    role = 'bot' if sender == BOT_NAME else 'user'
+    if source not in ('QQ', 'qq'):
+        role = 'internal'
+    return history_repository().history_add(sender, content, source, current_group.get(),
+                                            quote, current_message.get(), role)
 
-    quote: 可选的引用信息 {"sender": 被引用者, "text": 被引用的原话}。
-    长期记忆侧由 decompose_input 把引用解析成记忆片段；
-    这里的 quote 字段服务于短期上下文——让历史窗口能看到"这句话在回应什么"。
-    """
-    from core.virtual_clock import clock
-    with _lock:
-        record = {"sender": sender, "content": content, "source": source, "time": clock.now()}
-        if quote and quote.get("text"):
-            record["quote"] = {
-                "sender": quote.get("sender") or "",
-                "text": quote.get("text") or "",
-            }
-        _message_history.append(record)
-        if len(_message_history) > _max_history:
-            del _message_history[:len(_message_history) - _max_history]
-    save_state()
+def quote_suffix(msg):
+    quote = msg.get('quote') or {}
+    return f"，这是在回应{quote.get('sender') or '某人'}之前说的：“{quote['text']}”" if quote.get('text') else ''
 
-
-def quote_suffix(msg) -> str:
-    """把一条消息的引用渲染成后缀；无引用时返回空串。
-
-    用自然语序而非括号补充，避免与提示词里"禁止括号补充"的约束产生歧义。
-    """
-    quote = msg.get("quote") or {}
-    text = quote.get("text")
-    if not text:
-        return ""
-    quoted_sender = quote.get("sender") or "某人"
-    return f"，这是在回应{quoted_sender}之前说的：“{text}”"
-
-
-def render_message(msg) -> str:
-    """把一条历史消息渲染成可读文本（含引用）。"""
+def render_message(msg):
     return f"{msg['sender']}说：{msg['content']}{quote_suffix(msg)}"
 
+def get_all():
+    group = current_group.get()
+    # No default group means admin context, never a merged dialogue prompt.
+    return history_repository().history(group) if group is not None else []
 
 def get_recent(n=10):
-    with _lock:
-        recent = _message_history[-n:]
-    return "\n".join(render_message(m) for m in recent)
-
-
-def get_all():
-    with _lock:
-        return list(_message_history)
-
-
-def remove_last(n=2):
-    with _lock:
-        del _message_history[-n:]
-    save_state()
-
+    return '\n'.join(render_message(m) for m in get_all()[-n:])
 
 def save_state():
-    with _lock:
-        data = list(_message_history)
-    os.makedirs(os.path.dirname(_STATE_FILE), exist_ok=True)
-    tmp_file = _STATE_FILE + ".tmp"
-    with open(tmp_file, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-    os.replace(tmp_file, _STATE_FILE)
-
+    return None  # Every message is already committed.
 
 def load_state():
-    global _message_history, _flushed_count
-    if not os.path.exists(_STATE_FILE):
-        return
-    try:
-        with open(_STATE_FILE, "r", encoding="utf-8-sig") as f:
-            data = json.load(f)
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        print(f"[消息历史] 状态文件损坏，已重建：{_STATE_FILE}")
-        with _lock:
-            _message_history, _flushed_count = [], 0
-        return
-    with _lock:
-        _message_history = data[-_max_history:]
-        _flushed_count = len(_message_history)
-
+    return None  # Legacy import is an explicit offline migration.
 
 def flush_to_file():
-    global _flushed_count
-    with _lock:
-        pending = _message_history[_flushed_count:]
+    repo = history_repository()
+    with repo.lock:
+        rows = repo.query("SELECT value FROM settings WHERE key='history_log_cursor'")
+        cursor = int(rows[0]['value']) if rows else 0
+        pending = repo.query('SELECT * FROM messages WHERE seq>? ORDER BY seq', (cursor,))
         if not pending:
             return
-        _flushed_count = len(_message_history)
-    os.makedirs(os.path.dirname(_HISTORY_FILE), exist_ok=True)
-    with open(_HISTORY_FILE, "a", encoding="utf-8") as f:
-        for msg in pending:
-            # 与历史窗口保持一致的渲染，引用不落丢
-            f.write(render_message(msg) + "\n")
+        from pathlib import Path
+        Path(_HISTORY_FILE).parent.mkdir(parents=True, exist_ok=True)
+        with open(_HISTORY_FILE, 'a', encoding='utf-8') as f:
+            for row in pending:
+                f.write(json.dumps(row, ensure_ascii=False) + '\n')
+            f.flush()
+        repo.execute("INSERT OR REPLACE INTO settings VALUES('history_log_cursor',?)", (str(pending[-1]['seq']),))
