@@ -141,4 +141,4 @@ npm run dev --prefix frontend
 
 `manager.py` 是调用鉴权管理 API 的维护 CLI；`control_panel.py`、旧“启动控制面板”脚本只兼容启动同一个服务。`fix_memory_time.py` 兼容调用保守迁移工具，不再统一偏移全部时间。`metrics_excel.py` 为可选指标导出工具，与 bot 运行无关，需要 `openpyxl`。
 
-许可证见 [LICENSE](LICENSE)。项目伦理说明见 [MISEI-ETHICS.md](MISEI-ETHICS.md)。
+软件代码采用 Apache License 2.0，详见 [LICENSE](LICENSE)。项目伦理约定单独保留于 [MISEI-ETHICS.md](MISEI-ETHICS.md)，与软件版权许可并行适用。
